@@ -71,7 +71,7 @@ rebooting, never remounting `/usr`.
 | `/usr/local/bin/nxserver/nxserver.real` | box | yes | the stock binary, **renamed** (it already exists on any box, as `nxserver`) |
 | `<stick>/hermes_enable` | stick | yes | empty marker file; without it nothing is patched |
 | `<stick>/patch-fta.sh` | stick | yes | boot patcher: clock step, SUI patches, harness injection |
-| `<stick>/hermes_pvrui.js` | stick | yes | the TV harness (the file in `harness/`, same name on the stick) |
+| `<stick>/hermes_pvrui.js` | stick | yes | the TV harness |
 | `<stick>/ca-bundle.pem` | stick | yes | modern CA bundle; the firmware has no usable store |
 | `<stick>/xmltv-refresh.sh` | stick | yes | guide fetcher, loops every 5 minutes |
 | `<stick>/xmltv-build.sh` | stick | yes | XML → guide reducer, called by the fetcher |
