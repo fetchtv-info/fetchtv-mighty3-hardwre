@@ -67,7 +67,7 @@ rebooting, never remounting `/usr`.
 
 | Path | Where | Required | What it is |
 |---|---|---|---|
-| `/usr/local/bin/nxserver/nxserver` | box | yes | the wrapper (launcher) — the only installed file |
+| `/usr/local/bin/nxserver/nxserver` | box | yes | the wrapper (launcher) — the only installed file. Rename from nxserver-wrapper. |
 | `/usr/local/bin/nxserver/nxserver.real` | box | yes | the stock binary, **renamed** (it already exists on any box, as `nxserver`) |
 | `<stick>/hermes_enable` | stick | yes | empty marker file; without it nothing is patched |
 | `<stick>/patch-fta.sh` | stick | yes | boot patcher: clock step, SUI patches, harness injection |
