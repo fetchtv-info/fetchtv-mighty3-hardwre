@@ -1,0 +1,176 @@
+#!/bin/sh
+# FetchTV M616T - boot wrapper (launcher).
+#
+# This is the ONLY file installed on the box. Everything else it needs lives on a
+# USB stick: the boot patcher, the TV harness, the CA bundle, the guide fetcher
+# and (optionally) the recordings web page. That means changing the TV UI is
+# "edit the stick, reboot" - no /usr remount, no on-box editing.
+#
+# Installed as /usr/local/bin/nxserver/nxserver, with the stock binary renamed to
+# nxserver.real beside it. It ends with `exec nxserver.real`, so the real
+# middleware starts exactly as it always would, just after our pre-work.
+#
+# STICK LAYOUT (any /mnt/* mount on sd[b-z] - NOT sda, which is the PVR disk):
+#   hermes_enable        empty marker file; its presence arms everything below
+#   patch-fta.sh         boot patcher (SUI patches, clock step, harness injection)
+#   hermes_pvrui.js      the TV harness (same file as harness/hermes_pvrui.js;
+#                        the patcher copies it into the SUI under the same name)
+#   ca-bundle.pem        modern CA bundle for HTTPS
+#   xmltv-refresh.sh     guide fetcher (loops every 5 min itself)
+#   xmltv-build.sh       XML -> guide.txt reducer, called by the fetcher
+#   recweb.sh            optional: builds the recordings page
+#   darkhttpd            optional: static ARM server, from emikulic/darkhttpd
+#
+# FAILURE BEHAVIOUR: telnet comes up FIRST, before anything else, so a missing or
+# broken stick can never lock you out. Without a marked stick the box boots stock
+# - no harness, no patches - and still gives you a root shell to fix it.
+#
+# Runtime state (settings, timers, viewed map, logs, guide cache) stays on /root.
+# That is data, not installation.
+
+PORT=2323
+LOG=/root/hermes_boot.log
+
+log() { echo "$(date -u '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+
+# ---------------------------------------------------------------- 1. shell first
+# Before anything can fail. If the rest of this script is broken, this line has
+# still run and there is a way in.
+/bin/busybox telnetd -l /bin/sh -p "$PORT" >/dev/null 2>&1 &
+log "boot: telnet on $PORT"
+
+# ------------------------------------------------------------- 2. find the stick
+# Same rule the patcher uses: a real USB device (not sda, the PVR disk) with a
+# file called hermes_enable at its root. Polled for 20 s because the mount may
+# still be settling when the wrapper starts.
+find_stick() {
+  i=0
+  while [ $i -lt 20 ]; do
+    for m in $(mount | sed -n 's|^/dev/sd[b-z][0-9]* on \(/mnt/[^ ]*\) .*|\1|p'); do
+      if [ -f "$m/hermes_enable" ]; then
+        echo "$m"
+        return 0
+      fi
+    done
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+STICK=$(find_stick)
+
+if [ -z "$STICK" ]; then
+  # No payload stick: boot stock. Nothing is patched, the SUI does whatever the
+  # firmware does, and telnet is still there.
+  log "no payload stick found - booting stock"
+else
+  log "payload stick at $STICK"
+
+  # --------------------------------------------------------------- 3. TLS trust
+  # This firmware ships no usable CA store, so native HTTPS fails and the app
+  # decides it is offline. Point curl/openssl at the bundle on the stick.
+  if [ -f "$STICK/ca-bundle.pem" ]; then
+    SSL_CERT_FILE="$STICK/ca-bundle.pem"
+    CURL_CA_BUNDLE="$STICK/ca-bundle.pem"
+    export SSL_CERT_FILE CURL_CA_BUNDLE
+    log "ca bundle: $STICK/ca-bundle.pem"
+  else
+    log "ca bundle missing on stick - HTTPS will fail"
+  fi
+
+  # ------------------------------------------------------------ 4. boot patches
+  # Runs from the stick. The /usr copy is only a fallback for a half-migrated
+  # install; a package that follows the instructions has no such copy at all.
+  PATCH="$STICK/patch-fta.sh"
+  [ -f "$PATCH" ] || PATCH=/usr/local/bin/nxserver/patch-fta.sh
+  if [ -f "$PATCH" ]; then
+    sh "$PATCH" >/dev/null 2>&1
+    log "patch-fta: ran $PATCH"
+  else
+    log "patch-fta: not found - SUI will not be patched"
+  fi
+
+  # --------------------------------------------------------- 5. guide refresher
+  # The script loops on its own (check, sleep 300). It honours the "Use XML TV
+  # Guide" setting and only downloads when the cache is stale.
+  if [ -f "$STICK/xmltv-refresh.sh" ]; then
+    sh "$STICK/xmltv-refresh.sh" >/dev/null 2>&1 &
+    log "guide refresher started"
+  fi
+
+  # ------------------------------------------------------- 6. recordings page
+  # Optional: only if both the server binary and the page builder are present.
+  # Read-only - it never touches the PVR, and deleting stays in the TV UI so the
+  # middleware index keeps in step.
+  if [ -f "$STICK/darkhttpd" ] && [ -f "$STICK/recweb.sh" ]; then
+    (
+      while true; do
+        if [ -d /mnt/usb1/PVR ]; then
+          # rebuild only when the harness refreshed its title dump (or the page is
+          # missing), so the poll is usually a single stat
+          if [ ! -s /mnt/usb1/index.html ] || \
+             [ /root/hermes_web_meta.txt -nt /mnt/usb1/index.html ]; then
+            sh "$STICK/recweb.sh" >/dev/null 2>&1
+          fi
+          if ! pidof darkhttpd >/dev/null 2>&1; then
+            "$STICK/darkhttpd" /mnt/usb1 --port 8081 --index index.html \
+              --log /root/hermes_web.log >/dev/null 2>&1 &
+          fi
+        fi
+        sleep 60
+      done
+    ) >/dev/null 2>&1 &
+    log "recordings page: enabled on 8081"
+  fi
+fi
+
+# ------------------------------------------------------------------ 7. clock
+# The box has no RTC: it boots at 1970 and every TLS handshake fails until the
+# time is right. patch-fta.sh sets it once; this re-steps it every 30 minutes
+# because it drifts ~2 min per 14 h. Peers by IP so DNS is never in the boot path.
+(
+  while true; do
+    sleep 1800
+    busybox ntpd -q -n -p 162.159.200.1 >/dev/null 2>&1
+    busybox ntpd -q -n -p 216.239.35.0 >/dev/null 2>&1
+  done
+) >/dev/null 2>&1 &
+
+# --------------------------------------------------------------- 8. free space
+# df is the truth about free space; the native Ag_record_getDiskFreeSize()
+# over-reports by ~70 GB, far too much slack for a delete-before-full policy.
+(
+  while true; do
+    printf '%s %s\n' "$(date -u +%s)" \
+      "$(df -k /mnt/usb1 2>/dev/null | tail -1 | tr -s ' ')" > /root/hermes_storage.tmp
+    mv /root/hermes_storage.tmp /root/hermes_storage.txt 2>/dev/null
+    sleep 300
+  done
+) >/dev/null 2>&1 &
+
+# ------------------------------------------------------- 9. report-file pruning
+# The harness writes one JSON per event (ui_<seq>_<tag>.json) as its only means
+# of reporting. Nothing reads them back, but they pile up at ~200/day and a full
+# /root (240 MB) stops the harness writing settings, timers and the viewed map.
+# Keep the newest 200, drop anything older than 7 days, bin the dead one-off
+# outputs. Never touches hermes_viewed.json or guide_logos.json.
+prune_reports() {
+  ls -t $1 2>/dev/null | tail -n +$(( $2 + 1 )) | while read -r f; do rm -f "$f"; done
+}
+
+(
+  while true; do
+    rm -f /root/rv_*.json /root/e6_* /root/hermes_probe*.json 2>/dev/null
+    prune_reports "/root/ui_*.json" 200
+    prune_reports "/root/recovery_*.json" 20
+    # no -maxdepth here: this busybox find has none, and no subdirectory of /root
+    # holds report files
+    find /root -name 'ui_*.json' -mtime +7 -exec rm -f {} \; 2>/dev/null
+    sleep 21600
+  done
+) >/dev/null 2>&1 &
+
+# ------------------------------------------------------------- 10. the app itself
+log "starting nxserver.real"
+exec /usr/local/bin/nxserver/nxserver.real "$@"
