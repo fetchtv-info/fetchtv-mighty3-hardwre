@@ -21,6 +21,15 @@ This work has been largely created using AI tooling with Human editing and overs
 | [docs/02-storage-and-integrity.md](docs/02-storage-and-integrity.md) | eMMC partition map with offsets and mount points, boot partitions and RPMB, which regions are signature-verified and which are not, the SATA disk and its contents |
 | [docs/03-on-box-functions.md](docs/03-on-box-functions.md) | Binaries, the native `Ag_*` JavaScript surface, DVB tuner and EIT, recorder, playback, file I/O, remote key codes, clock and networking quirks — each marked tested or untested |
 | [tools/bolt_console.py](tools/bolt_console.py) | Commented Python example: interrupts the autoboot, unlocks the prompt, hands over a console |
+| [tools/fetch_inject.js](tools/fetch_inject.js) | Sends selected javascript pages to the STB via HTTPS (MITM). |
+| [tools/payload_readini.js](tools/payload_readini.js) | Reads the yx_config_user.ini from the STB |
+| [tools/payload_persist.js](tools/payload_persist.js) | Installs helper scripts for remote dev access without BOLT bootloader access |
+
+## Little Projects
+| Name | Description |
+|---|---|
+| PVR-Proof_of_concept | First run at exploring the native non-Fetch harness provided by the on-box tools via Hybroad and/or Broadcom |
+| HDFetchRun | Turns the box into a remote IP tuner for Jellyfin, ala HDHomeRun. |
 
 ## Verification labels
 
