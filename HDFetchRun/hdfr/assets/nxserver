@@ -1,0 +1,75 @@
+#!/bin/sh
+# HDFetchRun boot hook - replaces /usr/local/bin/nxserver/nxserver.
+#
+# Contract, deliberately small so it can be audited in one sitting:
+#   1. If HDFR is present and its config validates, point the browser at the
+#      HDFR page and start the daemon.
+#   2. Otherwise make sure the browser is NOT pointed at HDFR, and boot stock.
+#   3. Always hand off to the vendor launcher.
+#
+# Nothing here depends on the USB stick (the stick is not mounted yet when this
+# runs), and nothing writes anywhere except the vendor config file, /root/HDFR
+# and the two log files named below.
+
+ROOT=/root/HDFR
+INI=/root/yx_config_user.ini
+STOCK='file:///home/fetchtv/sui/internet_test_redirect.html'
+LOG=/root/hdfrd-boot.log    # outside $ROOT on purpose: "HDFR absent" must be logged too
+
+log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >> "$LOG" 2>/dev/null; }
+
+# Bound the boot log here, because when HDFR is absent no daemon exists to rotate it.
+[ -f "$LOG" ] && [ `wc -c < "$LOG"` -gt 32768 ] && mv "$LOG" "$LOG.1"
+
+# Development shell. Follows config.json "debug"; anything other than an explicit
+# "false" starts it, because this is the recovery path when the daemon misbehaves.
+DBG=`sed -n 's/.*"debug"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$ROOT/config.json" 2>/dev/null`
+if [ "$DBG" != "false" ]; then
+    /bin/busybox telnetd -l /bin/sh -p 2323 >/dev/null 2>&1
+fi
+
+# Boot-count breaker: if HDFR has been up for fewer than 90s three times in a
+# row, something is looping (a bad build, a recorder init that wedges the app).
+# Skip HDFR, boot stock, and leave the counter in place so it is visible.
+BC=/root/boot_count
+[ -f "$BC" ] || echo 0 > "$BC"
+COUNT=`cat "$BC" 2>/dev/null`
+case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$BC"
+if [ "$COUNT" -gt 3 ]; then
+    log "boot_count=$COUNT - too many short boots, skipping HDFR"
+    rm -f "$ROOT/logs/hdfrd.pid" 2>/dev/null
+    exec /usr/local/bin/nxserver/nxserver.real "$@"
+fi
+
+if [ -x "$ROOT/hdfrd" ] && [ -r "$ROOT/config.json" ] && [ ! -f "$ROOT/DISABLE" ] &&
+   "$ROOT/hdfrd" -configure -root "$ROOT" -ini "$INI" >> "$LOG" 2>&1; then
+    mkdir -p "$ROOT/logs" 2>/dev/null
+    # Keep the daemon's stdout bounded: it is only consulted after something
+    # went wrong, and it is the one log nothing else rotates.
+    if [ -f "$ROOT/logs/daemon.out" ] && [ `wc -c < "$ROOT/logs/daemon.out"` -gt 131072 ]; then
+        mv "$ROOT/logs/daemon.out" "$ROOT/logs/daemon.out.1"
+    fi
+    log "hdfrd present - starting daemon"
+    # A boot that survives 90 s proves it was not a loop: clear the counter.
+    ( sleep 90; echo 0 > "$BC" ) &
+    # setsid detaches it from the shell's session (the box has no nohup), so it
+    # survives the exec below and any later restart of the launcher.
+    /bin/setsid "$ROOT/hdfrd" -serve >> "$ROOT/logs/daemon.out" 2>&1 < /dev/null &
+else
+    if [ -f "$ROOT/DISABLE" ]; then
+        log "DISABLE file present - stock boot"
+    else
+        log "HDFR absent or unusable - stock boot"
+    fi
+    rm -f "$ROOT/logs/hdfrd.pid" 2>/dev/null   # stale from a previous boot
+    cur=`sed -n 's/^homepage_url=//p' "$INI" | tr -d ' \t\r'`
+    cur=${cur%\\}          # drop the vendor's trailing-backslash escape
+    if [ "$cur" != "$STOCK" ]; then
+        sed -i "s|^homepage_url=.*|homepage_url=$STOCK|" "$INI" && sync
+        log "homepage_url restored to stock (was: $cur)"
+    fi
+fi
+
+exec /usr/local/bin/nxserver/nxserver.real "$@"
