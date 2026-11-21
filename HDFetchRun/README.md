@@ -20,6 +20,8 @@ No transcoding is performed on the M616T, the stream is sent as-is.
 
 The HDHR code is written in Go for relative ease of reading and auditing. 
 
+WiFi is not supported.
+
 ## HDHomeRun surface
 
 | endpoint | behaviour |
@@ -158,20 +160,141 @@ reaches it over the LAN.
 The presence check is the executable bit on `hdfrd`. Removing or renaming that file is a complete,
 reversible disable: the next boot restores the stock homepage and boots the Fetch UI.
 
+## Building
+
+Built using golang-go 1.22 but 1.21, 1.23 should be fine. No other specific known requirements.
+Probably a good idea to read that build script though for path oddities.
+
+```sh
+apt install glang-go
+./build.sh          # CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7, static, stripped
+```
+I have also built this on windows using go 1.27.4. Use build.ps1 script. (read it first).
+
 ## Install / uninstall
+
+**This is at your own risk**
+
+Step 1: Get a dev shell on the box.
+If you know how to use a UART adaptor, you can use the bolt_console.py in the tools folder. You'll need to
+open the box up.
+
+If you prefer to not open the box or want another approach, download the fetch_inject.py and payload_persist.js into the same directory.
+Power off the set top box, and plug the Ethernet cable directly into an Ethernet cable on your computer.
+Configure that Ethernet port to a static IP and remember what it is. Examples use 192.168.50.1 / 255.255.255.0, no gateway or DNS settings needed here.
+
+Test the inject script:
+```sh
+sudo python3 fetch_inject.py --iface 192.168.50.1 --host-ip 192.168.50.1 --dhcp-range 192.168.50.2-192.168.50.20 --log events.jsonl
+```
+The box will power up, "Preparing system please wait". If all is working you should see log messages on your console in JSONL format. The first few lines are 
+just the config the script is running with.
+```sh
+{"seq":1,"t_mono_ns":38352454093620,"t_utc":"2026-11-21T08:04:52.223066+00:00","kind":"injection","dry_run":true,"payload":null,"route":null}
+{"seq":2,"t_mono_ns":38352460817675,"t_utc":"2026-11-21T08:04:52.229787+00:00","kind":"mode","dhcp":true,"host_ip":"192.168.50.1","broadcast":"192.168.50.255"}
+{"seq":3,"t_mono_ns":38352461333530,"t_utc":"2026-11-21T08:04:52.230302+00:00","kind":"ready","dns":"0.0.0.0:53","https":"0.0.0.0:443","dry_run":true}
+```
+..after some seconds you should see the DHCP and any HTTPS requests
+```sh
+{"seq":4,"t_mono_ns":38381409402057,"t_utc":"2026-11-21T08:05:21.178375+00:00","kind":"dhcp","client_ip":"0.0.0.0","mac":"0c:56:5c:00:00:00","msgtype":1,"vendor_class":"hybroad"}
+{"seq":5,"t_mono_ns":38381409615861,"t_utc":"2026-11-21T08:05:21.178584+00:00","kind":"dhcp_reply","mac":"0c:56:5c:00:00:00","msgtype":2,"offered_ip":"192.168.50.2","dest":"192.168.50.255"}
+...
+{"seq":16,"t_mono_ns":38389647167443,"t_utc":"2026-11-21T08:05:29.416138+00:00","kind":"dns","client_ip":"192.168.50.2","qname":"mw.fetchtv.com.au","qtype":1,"qclass":1}
+{"seq":17,"t_mono_ns":38389652204565,"t_utc":"2026-11-21T08:05:29.421176+00:00","kind":"tls_sni","sni":"mw.fetchtv.com.au"}
+{"seq":19,"t_mono_ns":38389678907438,"t_utc":"2026-11-21T08:05:29.447878+00:00","kind":"https","client_ip":"192.168.50.2","sni":"mw.fetchtv.com.au","method":"GET","path":"/v2/releases/prod/203013456778/genx/sui_redirect_nocache.htm","user_agent":"Takin/3.0.0 (Linux arm ; U; en), FetchTV_STB_BCM7252S/3.7.12096 (FetchTV, M616T, Wired)"}
+```
+
+In this example I'm going to MITM the sui_redirect_nocache.htm page. 
+Break out of the script with CTRL-C, power off the box again. We're going to intercept that web request that has *sui_redirect* in the URL
+```sh
+sudo python3 fetch_inject.py --iface 192.168.50.1 --host-ip 192.168.50.1 --dhcp-range 192.168.50.2-192.168.50.20 --payload-route '*sui_redirect*' --payload payload_persist.js --log events.jsonl
+```
+Power the box on again, wait a bit. The script will send the listed payload file. When that runs, that payload will send beacons back to indicate what worked and what happened in the log.
+Once/if you get to "stage=done&v=triggered", that's done. You've bricked the box or made a dev telnet shell. I only have a test unit of one so it could go either way.
+```sh
+{"seq":49,"t_mono_ns":38959021019026,"t_utc":"2026-11-21T08:14:58.789988+00:00","kind":"beacon","client_ip":"192.168.50.2","query":"stage=done&v=triggered"}
+```
+
+CTRL-C out of the script. POWER DOWN THE BOX. For ease run the "test" script again so we issue a DHCP address to the box when it comes back up. Then power the box up. It should look
+like nothing happened.
+See if you can connect via telnet. Yes I know, telnet. There's no sshd that I could find so you get what you're given.
+```sh
+root@T410:/home/box/HDFetchRun# telnet 192.168.50.2 2323
+Trying 192.168.50.2...
+Connected to 192.168.50.2.
+Escape character is '^]'.
+
+sh-3.2#
+```
+
+Stage 2. Put the HDFR files on there.
 
 Files are pushed over HTTP, verified by md5, then installed by a script that remounts `/usr`
 read-write only for the file swap:
 
-NOTE: I'm working on this bit, wait a bit and I'll clean it up otherwise you'll probably able to work it out yourself.
-
+In the Telnet shell:
 ```sh
+cd /tmp
+mkdir hdfr-stage
+cd hdfr-stage
+
 # on a host serving hdfr/build artifacts at :8090/dist
-wget -O /tmp/hdfr-stage/nxserver http://<host>:8090/dist/nxserver   # etc
+wget -O hdfrd http://<host>:8090/dist/hdfrd
+wget -O nxserver http://<host>:8090/dist/nxserver
+wget -O config.json http://<host>:8090/dist/config.json
+wget -O index.html http://<host>:8090/dist/index.html
+wget -O app.js http://<host>:8090/dist/app.js
+wget -O ca-bundle.pem http://<host>:8090/dist/ca-bundle.pem
+wget -O ui.css http://<host>:8090/dist/ui.css
+wget -O install.sh http://<host>:8090/dist/install.sh
+wget -O uninstall.sh http://<host>:8090/dist/uninstall.sh
 sh /tmp/hdfr-stage/install.sh /tmp/hdfr-stage
 ```
 
+This should look something like:
+```sh
+...
+sh-3.2# wget -O uninstall.sh http://192.168.50.1:8090/dist/uninstall.sh
+Connecting to 192.168.50.1:8090 (192.168.50.1:8090)
+uninstall.sh         100% |****************************************************************************************************************************************************|  1127   0:00:00 ETA
+sh-3.2# ls -l
+-rw-r--r--    1 root     root         26607 Jan  1 00:37 app.js
+-rw-r--r--    1 root     root        224449 Jan  1 00:39 ca-bundle.pem
+-rw-r--r--    1 root     root           278 Jan  1 00:37 config.json
+-rw-r--r--    1 root     root       7536800 Jan  1 00:37 hdfrd
+-rw-r--r--    1 root     root           651 Jan  1 00:37 index.html
+-rw-r--r--    1 root     root          3008 Jan  1 00:43 install.sh
+-rw-r--r--    1 root     root          3460 Jan  1 00:37 nxserver
+-rw-r--r--    1 root     root          1537 Jan  1 00:38 ui.css
+-rw-r--r--    1 root     root          1127 Jan  1 00:43 uninstall.sh
+sh-3.2# sh /tmp/hdfr-stage/install.sh /tmp/hdfr-stage
+install: config check
+hdfrd: homepage_url http://127.0.0.1:8080/ui/ (changed)
+hdfrd 0.5.0-phase5-20261121
+install: writing boot hook (remount /usr rw)
+-rwxr-xr-x    1 root     root          3460 Jan  1 00:43 nxserver
+-rwxr-xr-x    1 root     root        860619 Jan  1 00:01 nxserver.real
+install: done - power-cycle to boot HDFR
+sh-3.2#
+```
+So now, plug it back into your normal network and power off/on.
+
 `boot/uninstall.sh` restores the vendor launcher, puts `homepage_url` back and removes the tree.
+
+## First start
+
+If there are no channels scanned, it should auto-scan for them. Otherwise pressing Menu will bring up a small menu 
+
+<img width="1721" height="986" alt="HDFetchRun1" src="https://github.com/user-attachments/assets/69c99097-1d1f-4db3-af44-6220dff82725" />
+
+In your Jellyfin server, use the IP and Port displayed in the menu as the Tuner IP Address. Do not enable transcoding as the STB does not support it.
+You should also add the STB as the TV Guide Provider - in the example above, that'd be 
+```sh
+http://10.1.1.126:8080/guide.xml
+```
+
+The menu also displays the Channel being viewed on Live TV, as well as what the other tuners are doing (if anything).
+
 
 ## Recovery without a working daemon
 
@@ -193,16 +316,6 @@ the hook (32 KB, one rotation) because when HDFR is disabled no daemon exists to
 
 No authentication anywhere: the HDHomeRun protocol has none, telnet is a root shell, and the HTTP
 daemon answers every interface. LAN only — never port-forward this box.
-
-## Building
-
-Built using golang-go 1.22 but 1.21, 1.23 should be fine. No other specific known requirements.
-Probably a good idea to read that build script though for path oddities.
-
-```sh
-apt install glang-go
-./build.sh          # CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7, static, stripped
-```
 
 ### Source layout
 
