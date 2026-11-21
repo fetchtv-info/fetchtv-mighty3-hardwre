@@ -1,0 +1,55 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;      /* video plane shows through */
+  color: #00ff66;
+  font: 16px monospace;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.hidden { display: none !important; }
+
+/* Channel OSD: bottom-left, appears on a key press, hides itself. */
+#osd {
+  position: fixed;
+  left: 46px;
+  bottom: 46px;
+  padding: 14px 24px;
+  background: rgba(0, 0, 0, 0.72);
+  border-left: 4px solid #00ff66;
+  min-width: 320px;
+}
+#osd-ch { font-size: 30px; font-weight: bold; }
+#osd-name { font-size: 18px; color: #00c94f; margin-top: 4px; }
+
+/* Menu: left panel, table aligned so columns line up regardless of font. */
+#menu {
+  position: fixed;
+  left: 46px;
+  top: 46px;
+  padding: 18px 26px 14px 26px;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid #00ff66;
+  min-width: 620px;
+}
+#menu .title { font-size: 22px; letter-spacing: 3px; margin-bottom: 12px; }
+#menu table { border-collapse: collapse; }
+#menu td { padding: 5px 14px 5px 0; vertical-align: top; }
+#menu td.k { color: #00c94f; width: 190px; }
+#menu td.v { color: #00ff66; }
+#menu tr.sel td { background: #003b17; }
+#menu tr.sel td.k::before { content: "> "; }
+#menu .hint { color: #007c33; font-size: 13px; margin-top: 12px; }
+
+/* Full-screen message (errors, scan progress). */
+#msg {
+  position: fixed;
+  left: 0; right: 0; top: 40%;
+  text-align: center;
+  font-size: 22px;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.78);
+}
+#msg .sub { color: #00c94f; font-size: 16px; margin-top: 10px; }

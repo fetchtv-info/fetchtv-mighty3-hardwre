@@ -1,0 +1,13 @@
+{
+  "http_port": 8080,
+  "friendly_name": "FetchTV M616T",
+  "device_id": "00000000",
+  "log_max_bytes": 262144,
+  "log_keep": 3,
+  "debug": true,
+  "guide_offset": 0,
+  "guide_city": "Melbourne",
+  "guide_url": "",
+  "guide_refresh_hours": 24,
+  "ntp_server": "pool.ntp.org"
+}
