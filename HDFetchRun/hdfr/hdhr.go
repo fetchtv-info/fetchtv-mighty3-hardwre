@@ -115,6 +115,22 @@ func registerHdhr(mux *http.ServeMux, cmds *cmdQueue, log *Logger, cfgPath, root
 		json.NewEncoder(w).Encode(out)
 	})
 
+	// Plain M3U for media servers that take an "IPTV Automatic Network" rather
+	// than discovering HDHomeRun devices (see m3u.go for why that matters).
+	mux.HandleFunc("/playlist.m3u", func(w http.ResponseWriter, r *http.Request) {
+		cfg := h.cfg()
+		body := buildM3U(
+			h.channelList(),
+			guideIDs.channelIDs(h.guide.Path()),
+			h.baseURL(r),
+			cfg.GuideOffset,
+			cfg.GuideCity,
+		)
+		w.Header().Set("Content-Type", "audio/x-mpegurl; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		io.WriteString(w, body)
+	})
+
 	// Go subtree patterns end at a slash, so "/tuner/" would match "/tuner/0/v7"
 	// and NOT "/tuner0/v7" - register each tuner path the HDHR way instead.
 	for i := 0; i < tunerCount; i++ {
@@ -255,19 +271,25 @@ func (h *hdhr) viewingInfo() any {
 	return h.viewing
 }
 
-// releaseStream cancels the handler for lcn, which releases the tuner and
-// deletes the recording. Used when a client stops watching without closing its
-// connection, or when a media server forgets to close its tuner.
+// releaseStream frees a tuner on request. It must not wait for the streaming
+// handler to notice: this box cannot set write deadlines, so a handler blocked
+// in Write can sit there for minutes and the slot would stay taken. The map
+// entry is removed here, and the handler's own deferred release becomes a
+// no-op because the entry is already gone.
 func (h *hdhr) releaseStream(lcn string) bool {
 	h.mu.Lock()
 	ls, ok := h.streams[lcn]
-	h.mu.Unlock()
 	if !ok {
+		h.mu.Unlock()
 		return false
 	}
+	delete(h.streams, lcn)
+	h.mu.Unlock()
+
 	if ls.cancel != nil {
 		ls.cancel()
 	}
+	h.stopRecording(lcn, ls.file)
 	return true
 }
 
@@ -677,8 +699,12 @@ func (h *hdhr) release(lcn string) {
 	file := ls.file
 	h.mu.Unlock()
 
-	// Stop the recording and delete the file. The page does both; the daemon
-	// only asks, because the recorder belongs to the webview.
+	h.stopRecording(lcn, file)
+}
+
+// stopRecording asks the page to stop the recorder and then forgets the file.
+// The page owns the recorder, so the daemon only asks.
+func (h *hdhr) stopRecording(lcn, file string) {
 	c := h.cmds.add("stream_stop", lcn)
 	go func() {
 		rep, ok := h.cmds.wait(c.ID, 20*time.Second)

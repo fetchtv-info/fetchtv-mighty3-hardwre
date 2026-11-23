@@ -217,6 +217,8 @@
   function menuItems() {
     var items = [
       { k: "Jellyfin", v: daemonUrl() || "unknown", act: null },
+      { k: "IPTV playlist", v: daemonUrl() ? daemonUrl() + "playlist.m3u" : "unknown", act: null },
+      { k: "XMLTV guide", v: daemonUrl() ? daemonUrl() + "guide.xml" : "unknown", act: null },
       { k: "Channels", v: channels.length + " stored", act: null },
       { k: "Scan for channels", v: "clears the list, stops live TV", act: askScan },
       { k: "Refresh guide", v: guideSummary(), act: refreshGuide },
@@ -455,6 +457,7 @@
       if (c.cmd === "rec_stop") { cmdBusy = true; recStop(c); return; }
       if (c.cmd === "stream_start") { cmdBusy = true; streamStart(c); return; }
       if (c.cmd === "stream_stop") { cmdBusy = true; streamStop(c); return; }
+      if (c.cmd === "ua") { report(c, true, navigator.userAgent + " | appVersion=" + navigator.appVersion); return; }
       if (c.cmd === "reload") {
         /* Deploying app.js does not reload this webview, so a reboot used to be
            the only way to pick up a UI change. Report first, then reload. */
