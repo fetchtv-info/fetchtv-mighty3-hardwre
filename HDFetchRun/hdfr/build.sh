@@ -13,7 +13,7 @@ cd "$HERE"
 
 # Static, no cgo: the box has glibc 2014-era, do not link against it.
 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
-    "$GO" build -trimpath -ldflags "-s -w -X main.version=0.5.0-phase5-$(date -u +%Y%m%d)" \
+    "$GO" build -trimpath -ldflags "-s -w -X main.version=0.6.0-phase6-$(date -u +%Y%m%d)" \
     -o "$OUT/hdfrd" .
 
 cp "assets/index.html" assets/app.js assets/ui.css assets/config.json assets/ca-bundle.pem boot/nxserver boot/install.sh boot/uninstall.sh "$OUT"

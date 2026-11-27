@@ -1,42 +1,33 @@
 # HDFetchRun (HDFR)
 
 Turns a FetchTV M616T set-top box into a tuner Jellyfin can see as an HDHomeRun, with a
-minimal on-box UI driven by the retail remote (only used for setup). You will need to set
-up with the STB connected to a TV so that setup and TV scanning can be performed and you can
-confirm basic functionality. After that it's just a basic TV tuner (up/down for channel change).
+minimal on-box UI driven by the retail remote. Design and phase plan: `../DESIGN.md`.
+What the box actually does, as measured: `../phase0/FINDINGS.md`.
 
-The remaining three tuners can be accessed by Jellyfin over the network.
+**Status: phase 6.** Tuner emulation works end to end: Jellyfin discovers the box as an
+HDHomeRun, lists all channels, and plays them (verified on Android TV); VLC and other IPTV
+players use `playlist.m3u`. Three streams can record at once, on three different multiplexes
+(verified 2026-11-27), and a fourth waits for a free tuner or is refused. HDFR serves its own
+XMLTV guide and a read-only TVHeadend-compatible API. Phases: 0-3 the tuner surface and UI,
+4 the guide, 5 hardening, 6 the TVH API; stream resilience and tuner slots came after.
 
-Jellyfin discovers the box as an HDHomeRun, lists all channels, and plays them. Three concurrent
-streams are allowed and a fourth is refused. HDFR also serves its own XMLTV that Jellyfin uses
-for the guide. 
-
-## Design notes
-
-This behaviour has been tested on Jellyfin 12.2 and may not (probably doesn't) properly emulate
-an authentic HDHomeRun device. 
-
-No transcoding is performed on the M616T, the stream is sent as-is.
-
-The HDHR code is written in Go for relative ease of reading and auditing. 
-
-WiFi is not supported.
-
-## HDHomeRun surface
+## HDHomeRun surface (phase 3)
 
 | endpoint | behaviour |
 |---|---|
 | `/discover.json` | `ModelNumber` `HDHR-4DT` (deliberately not `hdtc`), `TunerCount` 3, `BaseURL`/`LineupURL` built from the request's `Host` |
-| `/lineup.json` | the page's channel list as `{GuideNumber, GuideName, URL, HD}`; URL is `http://<host>/tuner0/v<lcn>` |
-| `/tuner0/v<lcn>` | starts a recording of that LCN, tails the recorder's `.mpg` and writes chunked `video/mp2t` until the client goes away, then stops the recording and deletes the file |
+| `/lineup.json` | the page's channel list as `{GuideNumber, GuideName, URL, HD}`; URL is `http://<host>/auto/v<lcn>` |
+| `/auto/v<lcn>` | starts a recording of that LCN on any free tuner, tails the recorder's `.mpg` and writes `video/mp2t` until the client goes away, then stops the recording and removes it through the vendor PVR index |
+| `/tuner<N>/v<lcn>` | the same, on slot N (0-2): one viewer per slot, and a new request replaces what the slot was showing (see *Stream resilience*) |
 
-Measured on the unit: ~750 KB/s (~6 Mbps) per stream, valid TS (1808/1808 packets on 0x47), two
-concurrent streams on different channels work (separate handles and files), and the PVR directory
+Measured on the unit: ~750 KB/s (~6 Mbps) per stream, valid TS (1808/1808 packets on 0x47), three
+concurrent streams on three multiplexes work (separate handles and files), and the PVR directory
 returns to its baseline count after every disconnect. Two clients asking for the **same** channel
 share one recording and one tuner (refcounted in `hdhr.go`).
 
 The tail loop only reads and flushes; client loss is detected by the failed write or the request
-context, and either way the stop+delete command is queued to the page, which owns the recorder.
+context, and either way the stop is queued to the page, which owns the recorder; the daemon then
+deletes the recording by its PVR index entry (never by unlinking the file).
 
 Two details that matter in practice:
 
@@ -44,19 +35,21 @@ Two details that matter in practice:
   `/tunerN/v<ch>` and then streams from the device root, and Jellyfin does exactly that (its
   ffmpeg input is `http://<device>/`). So `/` is the transport stream of the most recently
   locked tuner and the UI lives at `/ui/`. Serving HTML at `/` made ffmpeg fail with exit 187.
+  Only the exact path `/` streams; any other unknown path is a 404 (the box's browser asks for
+  `/favicon.ico` on every page load, and streaming that held a tuner).
 * **Streams join at a keyframe.** The recorder starts writing mid-GOP, so the file's first
   bytes are usually undecodable until the next IDR. `ts.go` scans the growing file for a packet
   with the transport-level `random_access_indicator` and starts there; without it HD channels
   took noticeably longer to show a picture.
 
-## Guide
+## Guide (phase 4)
 
 The EPG is HDFR's own: it downloads the XMLTV, stores it under `/root/HDFR/guide/`, refreshes it
 on a timer and serves it to the media server. Nothing else has to be running on the box.
 
 | endpoint | behaviour |
 |---|---|
-| `/guide.xml` | the cached XMLTV with `<lcn>` shifted by `guide_offset`, so guide channels line up with lineups that were renumbered |
+| `/guide.xml` | the cached XMLTV with `<lcn>` shifted by `guide_offset`, so guide channels line up with lineups that were renumbered, and programme `<icon>`s removed (see *Thumbnails*) |
 | `/api/guide` | cache status: path, size, when it was fetched, last error, whether a refresh is running |
 | `/api/guide` (POST) | start a refresh now; the on-box menu's *Refresh guide* item calls this |
 | `/api/cities`, `/api/guide/city?name=…` | the built-in city table and the setter the menu's *Guide city* picker uses |
@@ -66,9 +59,11 @@ Two operational endpoints:
 - `POST /api/device?lcn=N&name=…` — the page reports what the box itself is tuned to;
   `/api/state` returns it as `viewing_lcn`. Only the page can see the vendor tuner, so this is
   self-reported, and it is deliberately *not* counted as a stream.
-- `POST /api/release?lcn=N` — cancels a stream handler, which releases the tuner and deletes the
-  recording. A media server can leave a tuner open for minutes after the viewer stops (Jellyfin's
-  live-TV kill timer), which otherwise occupies one of the three slots.
+- `POST /api/release?lcn=N` — cancels a stream handler, which releases the tuner and discards
+  the recording. A media server can leave a tuner open for minutes after the viewer stops (Jellyfin's
+  live-TV kill timer), which otherwise occupies one of the three slots. The stream record is removed
+  directly rather than left to the handler, because this box cannot set write deadlines and a
+  handler blocked in `Write` would otherwise keep the slot until its client finally dropped.
 
 Config: `guide_city` selects one of the 51 feeds in `cities.go` (the list from
 xmltv.net's Australian index) and takes precedence over `guide_url`, which is
@@ -83,10 +78,12 @@ Two things about this box specifically:
   clock is unset, fetches without certificate verification (the guide is public data). All of it
   is logged.
 * **Matching is by LCN.** Jellyfin pairs a tuner channel with a guide channel by the `<lcn>`
-  element, there is an offset of 250 applied that you might not like.. but this avoids existing 
-  live streams in my Jellyfin. You will likely need to manually map the channels to the guide in Jellyfin.
+  element, which is why the offset has to be applied to the guide as well as the lineup. The
+  Adelaide feed carries 48 channels; the box scans 59 (it lists duplicates and +2 variants), so
+  a subset of channels get programme data.
 
-## On-box UI
+
+## On-box UI (phase 2)
 
 The page (`index.html` + `app.js` + `ui.css`) is the only thing that can drive the tuner: the `Ag_*`
 bridge belongs to the webview. It is deliberately empty when idle, because the video plane is
@@ -99,8 +96,11 @@ composited *behind* it — anything drawn shows as an overlay on live TV.
 | OK / Menu | open the menu | activate item |
 | Back / Exit | hide the OSD | close the menu |
 
-Menu rows: the Jellyfin URL (taken live from `/api/state`, so it follows the DHCP lease), stored
-channel count, **Scan for channels** (asks for confirmation), **Debug harness on/off**, version.
+Menu rows: the Jellyfin, IPTV playlist, XMLTV guide and TVH API URLs (taken live from
+`/api/state`, so they follow the DHCP lease), stored channel count, **Scan for channels** (asks
+for confirmation), **Refresh guide**, **Guide city**, **Debug harness on/off**, tuned channels,
+what the box itself is showing, **Recording tuners** (`ok`, or a stuck-tuner warning), boot count
+and version.
 Rows marked `*` are actionable; info rows are not selectable.
 
 Behaviour worth knowing:
@@ -145,7 +145,7 @@ Behaviour worth knowing:
 
 `/usr/local/bin/nxserver/nxserver` is a four-branch shell hook (see `boot/nxserver`):
 
-1. Starts the development telnet shell on 2323 (ONLY IF NOT DISABLED - toggle in UI)
+1. Starts the development telnet shell on 2323.
 2. If `/root/HDFR/hdfrd` is executable and `config.json` validates, it calls
    `hdfrd -configure` (which points `homepage_url` at `http://127.0.0.1:<port>/`) and starts
    `hdfrd -serve` with `setsid`.
@@ -160,145 +160,22 @@ reaches it over the LAN.
 The presence check is the executable bit on `hdfrd`. Removing or renaming that file is a complete,
 reversible disable: the next boot restores the stock homepage and boots the Fetch UI.
 
-## Building
-
-Built using golang-go 1.22 but 1.21, 1.23 should be fine. No other specific known requirements.
-Probably a good idea to read that build script though for path oddities.
-
-```sh
-apt install glang-go
-./build.sh          # CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7, static, stripped
-```
-I have also built this on windows using go 1.27.4. Use build.ps1 script. (read it first).
-
 ## Install / uninstall
-
-**This is at your own risk**
-
-Step 1: Get a dev shell on the box.
-If you know how to use a UART adaptor, you can use the bolt_console.py in the tools folder. You'll need to
-open the box up.
-
-If you prefer to not open the box or want another approach, download the fetch_inject.py and payload_persist.js into the same directory.
-Power off the set top box, and plug the Ethernet cable directly into an Ethernet cable on your computer.
-Configure that Ethernet port to a static IP and remember what it is. Examples use 192.168.50.1 / 255.255.255.0, no gateway or DNS settings needed here.
-
-Test the inject script:
-```sh
-sudo python3 fetch_inject.py --iface 192.168.50.1 --host-ip 192.168.50.1 --dhcp-range 192.168.50.2-192.168.50.20 --log events.jsonl
-```
-The box will power up, "Preparing system please wait". If all is working you should see log messages on your console in JSONL format. The first few lines are 
-just the config the script is running with.
-```sh
-{"seq":1,"t_mono_ns":38352454093620,"t_utc":"2026-11-21T08:04:52.223066+00:00","kind":"injection","dry_run":true,"payload":null,"route":null}
-{"seq":2,"t_mono_ns":38352460817675,"t_utc":"2026-11-21T08:04:52.229787+00:00","kind":"mode","dhcp":true,"host_ip":"192.168.50.1","broadcast":"192.168.50.255"}
-{"seq":3,"t_mono_ns":38352461333530,"t_utc":"2026-11-21T08:04:52.230302+00:00","kind":"ready","dns":"0.0.0.0:53","https":"0.0.0.0:443","dry_run":true}
-```
-..after some seconds you should see the DHCP and any HTTPS requests
-```sh
-{"seq":4,"t_mono_ns":38381409402057,"t_utc":"2026-11-21T08:05:21.178375+00:00","kind":"dhcp","client_ip":"0.0.0.0","mac":"0c:56:5c:00:00:00","msgtype":1,"vendor_class":"hybroad"}
-{"seq":5,"t_mono_ns":38381409615861,"t_utc":"2026-11-21T08:05:21.178584+00:00","kind":"dhcp_reply","mac":"0c:56:5c:00:00:00","msgtype":2,"offered_ip":"192.168.50.2","dest":"192.168.50.255"}
-...
-{"seq":16,"t_mono_ns":38389647167443,"t_utc":"2026-11-21T08:05:29.416138+00:00","kind":"dns","client_ip":"192.168.50.2","qname":"mw.fetchtv.com.au","qtype":1,"qclass":1}
-{"seq":17,"t_mono_ns":38389652204565,"t_utc":"2026-11-21T08:05:29.421176+00:00","kind":"tls_sni","sni":"mw.fetchtv.com.au"}
-{"seq":19,"t_mono_ns":38389678907438,"t_utc":"2026-11-21T08:05:29.447878+00:00","kind":"https","client_ip":"192.168.50.2","sni":"mw.fetchtv.com.au","method":"GET","path":"/v2/releases/prod/203013456778/genx/sui_redirect_nocache.htm","user_agent":"Takin/3.0.0 (Linux arm ; U; en), FetchTV_STB_BCM7252S/3.7.12096 (FetchTV, M616T, Wired)"}
-```
-
-In this example I'm going to MITM the sui_redirect_nocache.htm page. 
-Break out of the script with CTRL-C, power off the box again. We're going to intercept that web request that has *sui_redirect* in the URL
-```sh
-sudo python3 fetch_inject.py --iface 192.168.50.1 --host-ip 192.168.50.1 --dhcp-range 192.168.50.2-192.168.50.20 --payload-route '*sui_redirect*' --payload payload_persist.js --log events.jsonl
-```
-Power the box on again, wait a bit. The script will send the listed payload file. When that runs, that payload will send beacons back to indicate what worked and what happened in the log.
-Once/if you get to "stage=done&v=triggered", that's done. You've bricked the box or made a dev telnet shell. I only have a test unit of one so it could go either way.
-```sh
-{"seq":49,"t_mono_ns":38959021019026,"t_utc":"2026-11-21T08:14:58.789988+00:00","kind":"beacon","client_ip":"192.168.50.2","query":"stage=done&v=triggered"}
-```
-
-CTRL-C out of the script. POWER DOWN THE BOX. For ease run the "test" script again so we issue a DHCP address to the box when it comes back up. Then power the box up. It should look
-like nothing happened.
-See if you can connect via telnet. Yes I know, telnet. There's no sshd that I could find so you get what you're given.
-```sh
-root@T410:/home/box/HDFetchRun# telnet 192.168.50.2 2323
-Trying 192.168.50.2...
-Connected to 192.168.50.2.
-Escape character is '^]'.
-
-sh-3.2#
-```
-
-Stage 2. Put the HDFR files on there.
 
 Files are pushed over HTTP, verified by md5, then installed by a script that remounts `/usr`
 read-write only for the file swap:
 
-In the Telnet shell:
 ```sh
-cd /tmp
-mkdir hdfr-stage
-cd hdfr-stage
-
 # on a host serving hdfr/build artifacts at :8090/dist
-wget -O hdfrd http://<host>:8090/dist/hdfrd
-wget -O nxserver http://<host>:8090/dist/nxserver
-wget -O config.json http://<host>:8090/dist/config.json
-wget -O index.html http://<host>:8090/dist/index.html
-wget -O app.js http://<host>:8090/dist/app.js
-wget -O ca-bundle.pem http://<host>:8090/dist/ca-bundle.pem
-wget -O ui.css http://<host>:8090/dist/ui.css
-wget -O install.sh http://<host>:8090/dist/install.sh
-wget -O uninstall.sh http://<host>:8090/dist/uninstall.sh
+wget -O /tmp/hdfr-stage/nxserver http://<host>:8090/dist/nxserver   # etc
 sh /tmp/hdfr-stage/install.sh /tmp/hdfr-stage
 ```
 
-This should look something like:
-```sh
-...
-sh-3.2# wget -O uninstall.sh http://192.168.50.1:8090/dist/uninstall.sh
-Connecting to 192.168.50.1:8090 (192.168.50.1:8090)
-uninstall.sh         100% |****************************************************************************************************************************************************|  1127   0:00:00 ETA
-sh-3.2# ls -l
--rw-r--r--    1 root     root         26607 Jan  1 00:37 app.js
--rw-r--r--    1 root     root        224449 Jan  1 00:39 ca-bundle.pem
--rw-r--r--    1 root     root           278 Jan  1 00:37 config.json
--rw-r--r--    1 root     root       7536800 Jan  1 00:37 hdfrd
--rw-r--r--    1 root     root           651 Jan  1 00:37 index.html
--rw-r--r--    1 root     root          3008 Jan  1 00:43 install.sh
--rw-r--r--    1 root     root          3460 Jan  1 00:37 nxserver
--rw-r--r--    1 root     root          1537 Jan  1 00:38 ui.css
--rw-r--r--    1 root     root          1127 Jan  1 00:43 uninstall.sh
-sh-3.2# sh /tmp/hdfr-stage/install.sh /tmp/hdfr-stage
-install: config check
-hdfrd: homepage_url http://127.0.0.1:8080/ui/ (changed)
-hdfrd 0.5.0-phase5-20261121
-install: writing boot hook (remount /usr rw)
--rwxr-xr-x    1 root     root          3460 Jan  1 00:43 nxserver
--rwxr-xr-x    1 root     root        860619 Jan  1 00:01 nxserver.real
-install: done - power-cycle to boot HDFR
-sh-3.2#
-```
-So now, plug it back into your normal network and power off/on.
-
 `boot/uninstall.sh` restores the vendor launcher, puts `homepage_url` back and removes the tree.
-
-## First start
-
-If there are no channels scanned, it should auto-scan for them. Otherwise pressing Menu will bring up a small menu 
-
-<img width="1721" height="986" alt="HDFetchRun1" src="https://github.com/user-attachments/assets/69c99097-1d1f-4db3-af44-6220dff82725" />
-
-In your Jellyfin server, use the IP and Port displayed in the menu as the Tuner IP Address. Do not enable transcoding as the STB does not support it.
-You should also add the STB as the TV Guide Provider - in the example above, that'd be 
-```sh
-http://10.1.1.126:8080/guide.xml
-```
-
-The menu also displays the Channel being viewed on Live TV, as well as what the other tuners are doing (if anything).
-
 
 ## Recovery without a working daemon
 
-telnet 2323 is started by the hook before anything that can fail, so it is always there. Unless it isn't because it's been disabled in the UI.
+telnet 2323 is started by the hook before anything that can fail, so it is always there:
 
 ```sh
 mv /root/HDFR/hdfrd /root/HDFR/hdfrd.off     # disable; next boot is stock
@@ -317,6 +194,14 @@ the hook (32 KB, one rotation) because when HDFR is disabled no daemon exists to
 No authentication anywhere: the HDHomeRun protocol has none, telnet is a root shell, and the HTTP
 daemon answers every interface. LAN only — never port-forward this box.
 
+## Building
+
+```sh
+./build.sh          # CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7, static, stripped
+```
+Also built on Windows at least once and it worked fine with latest golang. Check the build powershell script in tools.
+
+
 ### Source layout
 
 Everything in `hdfr/` is one Go package (`package main`), so **every non-test `.go` file is
@@ -326,26 +211,116 @@ package. Add a file and it joins the build; delete one and the build breaks wher
 | file | what it does |
 |---|---|
 | `main.go` | entry point; the `-serve` / `-configure` / `-restore` / `-stop` / `-version` flags |
-| `hdhr.go` | HDHomeRun surface: discover, lineup, tuner lock, stream loop, registry, sweep, release |
-| `server.go` | HTTP routing, `/api/state`, `/api/log`, `/api/pvr`, request logging, guide id shifting |
+| `hdhr.go` | HDHomeRun surface: discover, lineup, `/tunerN` slots and `/auto` pool, recorder start/stop, file identification, stream loop, registry, sweeps, release, stuck-tuner detection, served-guide cache |
+| `handles.go` | vendor recorder handle ownership: one stop per recording, never a stop for a handle a newer recording holds |
+| `service.go` | which service a recording carries (PMT program number) and the learned per-channel map |
+| `ts.go` | transport-stream alignment, keyframe and live-edge scanning |
+| `server.go` | HTTP routing, `/api/state`, `/api/health`, `/api/log`, `/api/pvr`, `/api/cmd`, request logging, guide LCN shifting and programme-icon stripping |
+| `cmd.go` | command queue between daemon and page (`/api/next`, `/api/report`) |
+| `m3u.go` | `playlist.m3u` for IPTV importers (VLC, TVHeadend), XMLTV id lookup |
+| `tvhapi.go` | read-only TVHeadend-compatible API (phase 6) |
+| `radio.go` | recognising audio-only services, which the box cannot record |
 | `guide.go` | EPG: fetch, cache, status, refresh timer, CA bundle |
+| `cities.go` | the 51-city XMLTV table |
 | `config.go` | config struct, defaults, validation, atomic save |
 | `ntp.go` | SNTP query and clock stepping |
-| `ts.go` | transport-stream alignment, keyframe and live-edge scanning |
 | `inifile.go` | reading/writing `homepage_url` in the vendor INI |
-| `cmd.go` | command queue between daemon and page (`/api/next`, `/api/report`) |
-| `cities.go` | the 51-city XMLTV table |
 | `log.go` | size-rotating logger |
 | `stop.go` | `-stop`: pidfile, or `/proc` fallback |
 | `net.go` | finding the box's IPv4 |
 
-Not compiled in:  everything that is not Go — `build.sh`, `go.mod`, `assets/` (UI and default config), `boot/` (the shell hook)
+Not compiled in: everything that is not Go — `build.sh`,
+`build.ps1`, `go.mod`, `assets/` (UI and default config), `boot/` (the shell hook).
 
 Reading order for someone new to the codebase: `main.go` → `server.go` → `hdhr.go`. Those are the
 spine; the rest are leaves. Only the standard library is used, deliberately: it cross-compiles to a
-static ARM binary and stays auditable. Line counts are from the phase 5 build.
+static ARM binary and stays auditable.
 
-## Hardening
+## Stream resilience
+
+The daemon cannot ask the box which file a recorder writes, so it identifies it,
+verifies it and owns its teardown:
+
+- **Identification** — a start completes under the start lock: snapshot the PVR
+  directory, start, then adopt the file that *grows*. The file is claimed until
+  its stream is registered, so two starts can never adopt the same file.
+- **Verification** — the recording's PMT names the service actually recorded;
+  the program number is learned per channel (`state/programs-pmt.json`) and every
+  later start is checked against it. A mismatch is rejected, never served. Values
+  are only learned from a file this start created.
+- **Handle ownership** — vendor handles are recycled immediately. Every
+  successful start claims its handle for its record id; a stop for a record that
+  no longer owns the handle is never sent, and each record is stopped once.
+- **Stall recovery** — 2 s without new data restarts the recorder for the same
+  channel; 25 s without data drops the connection.
+- **Health** — `/api/health` fails if the stream lock is stuck, so a wedged daemon
+  is not reported as healthy.
+
+**Tuner slots.** `/tuner<N>/v<lcn>` (N = 0-2) is one viewer: a new request on a
+slot replaces the stream that slot holds - a player changing channel says so
+explicitly instead of the daemon waiting for the old connection to close. Same
+channel again hands the running recording over (instant); another channel ends the
+old stream first so its tuner is free. Only the client that holds a slot can
+replace it; another machine on a busy slot is served from the pool. `/auto/v<lcn>`
+is the pooled path (any free tuner, no replacement) and is what `lineup.json`
+advertises, because a media server opens several streams at once.
+`/playlist.m3u?tuner=N` puts every entry on slot N (default 0), `?tuner=auto` on
+the pool - e.g. one TVHeadend IPTV network per slot, each with max streams 1.
+`/api/state` lists occupied `slots`.
+
+TL;DR:
+| App | URL | Why |
+|---|---|---|
+| VLC | http://<ip>:8080/playlist.m3u | The playlist stream URLs will be 'locked' to a tuner. When changing streams, HDFR will recognises the current stream should stop then start the next. |
+| | or http://<ip>:8080/playlist.m3u?tuner=1 (values 0-2) | This just maipulates which 'tuner' is in the playlist URLs. We can't really lock to a tuner, it's out of our hands. It's really just optimises the freeing of previously used tuners |
+| Jellyfin | http://<ip>:8080 | Add it as an HDHomeRun Tuner. Jellyfin will get a 'lineup.json' file, and HDFR will try and auto-allocate tuners as best it can. |
+| TVHeadEnd | TBA | This was proving problematic so it has been parked for now but work will continue. It could work, who knows. |
+
+`warm_seconds` (config) keeps a recorder running after the viewer leaves. With
+handle ownership fixed it is not needed for clean switching (20/20 measured with
+it at 0 and at 10); it only makes switching *back* to the previous channel
+instant, at the cost of a tuner. EXPERIMENTAL. Don't use it.
+
+## TVHeadend-compatible API (phase 6)
+
+Kind of. Unfinshed. It's parked at the moment. 
+A read-only subset of TVH's HTTP API, so a TVH-native client can be pointed
+straight at HDFR instead of at a TVH instance. **No authentication and no
+`/comet/events`** — that is a deliberate scope decision, not an omission.
+
+| Endpoint | Returns |
+|---|---|
+| `/api/serverinfo` | `api_version: 20`, name `HDFR`, `sw_version: hdfr-<build>` |
+| `/api/channel/grid` | one entry per streamable channel: `uuid` (md5 of the LCN), `name`, `number` = LCN, `services`, `epggrab` |
+| `/api/epg/events/grid` | XMLTV programmes as TVH events: `eventId`, `channelUuid`, `channelNumber`, `start`, `stop`, `title`, `description`, `image`, `nextEventId` |
+| `/stream/channel/<uuid>` | MPEG-TS from the pool, served by the same path as `/auto/v<lcn>` |
+| `/api/dvr/entry/grid` | always empty — HDFR does not record |
+| `/api/status/subscriptions` | the live streams, which is what TVH's Status page shows |
+
+Notes that matter operationally:
+
+- **The uuid is a contract.** It is `md5("hdfr:<lcn>")`, so it is stable across
+  restarts; clients cache channel and EPG state against it. Changing the scheme
+  would look like every channel vanished.
+- **`api_version: 20`** is what TVH 4.3 reports. Clients gate features on it and
+  several refuse to connect to anything lower, so the number is part of the
+  interface, not a claim about the internals.
+- **The EPG is parsed from the same `guide.xml`** the playlist uses, once per
+  file change (not per request): ~9 MB, ~1.5 s on the box, ~10 800 programmes.
+  The parse is streaming, because the file is much larger than spare memory.
+- **Audio-only services are excluded** from the grid, as they are from the
+  playlist: the box cannot record them, so advertising them guarantees failures.
+- **Every stream starts with PSI.** The recording is joined at a video keyframe,
+  and on this box the PAT/PMT can sit ~200 KB further on (~0.4 s). Scanners cope;
+  TVHeadend does not — its libav runs with `analyzeduration=0`, decides stream
+  parameters from the first packets, reported the audio as `mp3, 0 channels`,
+  failed to write a header and dropped the mux with *No input detected*. The
+  daemon now writes the recorded PAT/PMT (three repetitions) before the keyframe
+  data, so the first packets are self-describing.
+- **Channel `number` is the real LCN** (1 = "10", 2 = "ABC TV", 7 = "7 Adelaide"),
+  not the LCN+`guide_offset` value used in the M3U `tvg-chno`.
+
+## Hardening (phase 5)
 
 What protects the box from a bad day:
 
@@ -362,6 +337,115 @@ What protects the box from a bad day:
 Deploying a UI or binary change no longer needs a power cycle: `hdfrd -stop`, copy, restart, then
 `curl "/api/cmd?cmd=reload"` to make the page pick up new `app.js`.
 
+## Endpoints
+
+| path | what it is |
+|---|---|
+| `/discover.json` | HDHomeRun discovery document |
+| `/lineup.json` | HDHomeRun channel list (URL = `/auto/v<lcn>`) |
+| `/auto/v<lcn>` | any free tuner: lock that channel and stream MPEG-TS |
+| `/tuner<N>/v<lcn>` | slot N (0-2): one viewer, a new request replaces the slot's stream |
+| `/` | the stream itself, for clients that lock then read the device root (exact path only) |
+| `/playlist.m3u` | M3U playlist of every TV channel on slot 0; `?tuner=N` for slot N, `?tuner=auto` for the pool |
+| `/guide.xml` | XMLTV guide, `<lcn>` shifted by `guide_offset` |
+| `/api/serverinfo`, `/api/channel/grid`, `/api/epg/events/grid` | TVH-compatible read-only API (phase 6) |
+| `/ui/` | the on-box TV interface |
+
+`/playlist.m3u` exists because TVHeadend (and similar) cannot see HDFR as an HDHomeRun
+device: HDHomeRun discovery is a UDP broadcast on port 65001, while HDFR is HTTP only.
+An "IPTV Automatic Network" pointed at the playlist is the supported way in. TVH cannot
+fetch XMLTV from a URL itself; its XMLTV grabber runs a command, e.g. a two-line script
+that does `curl -fsS http://<box>:8080/guide.xml`. Two details make it bind correctly, and both come
+from data HDFR already has:
+
+- `tvg-id` is the XMLTV `<channel id>` read back out of the guide cache, so programmes
+  attach to the right service. Channels absent from the guide simply omit the attribute.
+- `tvg-chno` is the lineup's `GuideNumber` (LCN + `guide_offset`), matching `/lineup.json`
+  and the rewritten `<lcn>`, so channel numbers agree across both interfaces.
+
+Tuner accounting is invisible to these clients: they do not know about the three-tuner
+limit or the lock/stream contract, so a fourth simultaneous stream shows up to them as a
+tune failure rather than as a clear message. The way round it is one IPTV network per slot
+(`playlist.m3u?tuner=0`, `1`, `2`), each limited to one stream, which hands the accounting
+to the importer.
+
+Audio-only services are **excluded from `lineup.json`, the playlist and the TVH grid**: the box accepts a
+start for them but never writes a file, so every attempt is a guaranteed failure. A direct
+request for one returns `403 audio-only channel` immediately. The box exposes no service
+type, so `radio.go` combines two signals:
+
+- **Learned, works anywhere:** a start that is accepted but records nothing *while another
+  channel on the same multiplex is recording* proves the tuner is fine and the service is
+  not recordable. The channel is saved in `state/audio-only.json` (delete it to forget, e.g.
+  after a rescan). The first such request fails once; every later one is refused at once.
+- **Names, before the first try:** config `radio_names`, matched as whole words,
+  case-insensitively. Absent means the built-in list (Australian radio networks: `radio`,
+  `triple j`, `abc classic`, `rn`, ...); set your own words for another region, or `[]` to rely
+  on learning alone.
+
+
+Two behaviours make concurrent scanning work better:
+
+- **Queue for a tuner** (`tunerWait`, 25 s) rather than refusing with 503 the moment all
+  three are busy — a scanner that waits succeeds.
+- **Serialise and retry starts**: the page processes one recorder command at a time, and
+  the box answers `h=-1` / `no file appeared` while the previous recording is still
+  closing, so starts are taken under a mutex and retried up to three times.
+
+### Warm recordings (`warm_seconds`)
+
+EXPERIMENTAL. Don't use it. Also, don't let me tell you what to do.
+The box needs ~4–5 s to create a recording after being asked, and IPTV scanners allow a
+mux only ~5 s, so a cold first request is a coin flip. After the last viewer leaves, the
+recorder is therefore left running for `warm_seconds` (default 90, `0` disables; this box
+runs with `0`), and a repeat request for the same channel is answered from the live edge
+immediately:
+
+```
+cold v7:  5.4 s to first byte
+warm v7:  0.0 s
+```
+
+One warm stream is kept at a time (`warmCap`). A new start that needs the tuner reclaims
+the warm one instead of making the client wait, warm streams are hidden from the
+"Tuned channels" list because nobody is watching them, and they are stopped on shutdown —
+a warm recorder has no streaming handler to notice the process leaving, and an orphaned
+recorder keeps writing until the box reboots.
+
+Measured after both changes: six simultaneous probes on six channels all return
+`200` with real TS, spread over 18 s, and the tuner count returns to zero afterwards.
+
+Warm recordings were later found not to be needed for clean switching: the "slow start after
+a stop" they worked around was the recycled-handle bug (see *Stream resilience*). They now only
+make switching *back* to the previous channel instant, at the cost of a tuner.
+
+## Thumbnails (parked)
+
+Jellyfin accepts per-channel and per-programme images from XMLTV (`<icon>`, `<image type="still">`),
+and channel logos already come through from the feed. The feed's we are using has prgramme icons that 
+point at URLs that do not resolve for me, causing Jellyfin to wait ~100 s on each fetch and guide
+refreshes would take an age. Our `/guide.xml` strips programme `<icon>`s (channel logos are kept, the cached file is
+untouched) and the TVH API sends no `image`. Generating stills was investigated and parked:
+
+- `Ag_localPlayer_generateThumbnail` exists on the bridge (arity 1) but returns `-1` for every
+  argument shape tried — relative path, absolute path, offsets, even bare handles — and
+  `Ag_localPlayer_getThumbnail` likewise. It appears to require media loaded through `localPlayer`,
+  which this page never uses (live TV goes through `Ag_dvb`), and no caller exists anywhere under
+  `/webpage` to learn the real contract from.
+- RDK's `org.rdk.ScreenCapture` is referenced in the vendor bundle but unreachable: `$badger`,
+  `ThunderJS` and `webapis` are all undefined in our page; only the `Ag_*` bridge is exposed.
+- `ecmax_localPlayer_generateThumbnailFromVideo` (the native name behind the wrappers) is not exposed
+  either: the bridge has 697 members and **none** begin with `ecmax_`, and no `*FromVideo` variant
+  exists. It is also absent from `/webpage`. Reaching it would mean calling into the vendor's native
+  library from outside its process — code injection rather than a feature, on a box with a watchdog.
+- The remaining route is ffmpeg off-box against a tuner stream: it costs a tuner plus a helper
+  process, so it stays parked until there is a reason to spend either.
+
+Also checked: `VideoCodec: "none"` is **not** a supported lineup flag. `HdHomerunHost` copies codecs
+from the lineup but hardcodes `ChannelType = ChannelType.TV`, so radio channels cannot be marked
+audio-only that way (M3U tuners get `ChannelType.Radio` from `radio="true"`; HDHomeRun has no
+equivalent). Radio is therefore a capture-time filter, not a lineup flag.
+
 ## Auditing this
 
 For someone reviewing what runs on their box:
@@ -373,7 +457,7 @@ For someone reviewing what runs on their box:
   `false`, a telnet shell on `:2323` for recovery. No authentication on either — LAN only.
 - **What it writes**: `$ROOT` (`/root/HDFR`: binary, UI, config, logs, guide cache, state),
   `/root/yx_config_user.ini` (one key), `/root/boot_count`, `/root/hdfrd-boot.log`, and
-  recordings under `/mnt/usb1/PVR` (deleted when the stream ends).
+  recordings under `/mnt/usb1/PVR` (removed through the vendor PVR index when the stream ends).
 - **What it reads**: its own config, the box's channel list via the page, and the recorder's files.
 - **How to remove it**: `boot/uninstall.sh` restores the vendor launcher and deletes `$ROOT`;
   `hdfrd -restore` puts `homepage_url` back.

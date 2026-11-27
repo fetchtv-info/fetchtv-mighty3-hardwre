@@ -138,7 +138,7 @@ func buildM3U(channels []Channel, ids map[int]string, base string, offset int, g
 		}
 		fmt.Fprintf(&b, " tvg-chno=\"%d\" tvg-name=\"%s\" group-title=\"%s\",%s\n",
 			c.LCN+offset, name, m3uAttr(group), name)
-		fmt.Fprintf(&b, "%s/tuner0/v%d\n", base, c.LCN)
+		fmt.Fprintf(&b, "%s/v%d\n", base, c.LCN) // base ends in /tunerN or /auto
 	}
 	return b.String()
 }

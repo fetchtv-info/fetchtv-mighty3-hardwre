@@ -52,6 +52,23 @@ func shiftGuideLCNs(xml []byte, offset int) []byte {
 	})
 }
 
+// guideProgramme matches one <programme> element, and programmeIcon an <icon>
+// inside it (self-closing or with a body), with the indentation before it.
+var (
+	guideProgramme = regexp.MustCompile(`(?s)<programme\b.*?</programme>`)
+	programmeIcon  = regexp.MustCompile(`(?s)[ \t]*<icon\b[^>]*?(?:/>|>.*?</icon>)[ \t]*\r?\n?`)
+)
+
+// stripProgrammeIcons removes programme artwork from the guide, keeping channel
+// logos. The feed's programme icons point at fetchtv.com.au image URLs that no
+// longer answer, and Jellyfin waits ~100 s on each one. Fetching or hosting
+// artwork is outside what HDFR is for, so the cleanest guide has none.
+func stripProgrammeIcons(xml []byte) []byte {
+	return guideProgramme.ReplaceAllFunc(xml, func(prog []byte) []byte {
+		return programmeIcon.ReplaceAll(prog, nil)
+	})
+}
+
 // dirBytes sums the sizes of the files directly inside dir, for /api/state. It
 // lets an operator (or the acceptance script) see retention at a glance.
 func dirBytes(dir string) int64 {
@@ -127,6 +144,12 @@ func serveHTTP(root string) error {
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
+		// "Process answers" is not health: a daemon wedged on its stream lock
+		// still serves this page but no stream. Check the lock can be taken.
+		if !hd.lockResponsive(2 * time.Second) {
+			http.Error(w, "stream state lock is stuck", http.StatusServiceUnavailable)
+			return
+		}
 		fmt.Fprintln(w, "ok")
 	})
 
@@ -144,7 +167,7 @@ func serveHTTP(root string) error {
 		pending, last := cmds.snapshot()
 		state := map[string]any{
 			"version":       version,
-			"phase":         5,
+			"phase":         6,
 			"ip":            ip,
 			"http_port":     cur.HTTPPort,
 			"friendly_name": cur.FriendlyName,
@@ -155,6 +178,8 @@ func serveHTTP(root string) error {
 			"last_report":   last,
 			"boot_count":    bootCount(),
 			"streams":       hd.activeStreams(),
+			"slots":         hd.slotsInfo(),
+			"tuner_warning": hd.tunerWarningText(),
 			"viewing_lcn":   hd.viewingInfo(),
 			"log_bytes":     dirBytes(filepath.Join(root, "logs")),
 		}
@@ -258,21 +283,13 @@ func serveHTTP(root string) error {
 
 	// Cleanup. The recorder names files record<N>.mpg (plus .mda/.nav metadata);
 	// deleting all three is what makes streaming leaks recoverable.
+	// Recordings are deleted through the vendor PVR index, never by unlinking.
+	// Unlinking leaves a stale index entry, after which the box reuses the name
+	// for the next recording and truncates whatever occupies it - which destroyed
+	// an owner recording on 2026-11-25. Kept as an explicit refusal rather than
+	// removed, so an old client gets a clear answer instead of a 404.
 	mux.HandleFunc("/api/pvr_delete", controlGuard(func(w http.ResponseWriter, r *http.Request) {
-		name := r.URL.Query().Get("name")
-		if !validRecName.MatchString(name) {
-			http.Error(w, "name must match record<N>.mpg", http.StatusBadRequest)
-			return
-		}
-		base := strings.TrimSuffix(name, ".mpg")
-		var removed []string
-		for _, ext := range []string{".mpg", ".mda", ".nav"} {
-			if err := os.Remove(filepath.Join(pvrDir, base+ext)); err == nil {
-				removed = append(removed, base+ext)
-			}
-		}
-		log.Printf("pvr delete %s -> %v", base, removed)
-		writeJSON(w, map[string]any{"removed": removed})
+		http.Error(w, "unlinking recordings is disabled: delete by index instead", http.StatusGone)
 	}))
 
 	// Debug-harness toggle. Reachable from the box itself always (the menu uses
@@ -323,6 +340,9 @@ func serveHTTP(root string) error {
 	go func() {
 		<-stop
 		log.Printf("shutting down")
+		// Stop recorders first: a warm one has no handler to notice we are
+		// leaving, and an orphaned recorder keeps writing until the box reboots.
+		hd.stopAll()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)

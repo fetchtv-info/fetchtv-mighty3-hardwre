@@ -35,6 +35,12 @@ type Config struct {
 	// the menu only has to write a city name. Set it empty and use guide_url
 	// for a custom feed.
 	GuideCity string `json:"guide_city"`
+	// WarmSeconds keeps a tuner recording for this long after the last viewer
+	// leaves, so a repeat request for the same channel is instant instead of
+	// waiting ~5s for the box to start a recorder. Scanners give up after five
+	// seconds, so this is what makes a rescan succeed; it costs a tuner while
+	// warm. 0 disables it.
+	WarmSeconds int `json:"warm_seconds"`
 	// NTPServer is queried once at start-up to bring the clock forward. The box
 	// otherwise believes it is 1970, which breaks TLS, guide freshness and
 	// recording timestamps. Empty disables it.
@@ -57,6 +63,7 @@ func defaultConfig() Config {
 		GuideCity:         "Adelaide",
 		GuideRefreshHours: 24,
 		NTPServer:         "pool.ntp.org",
+		WarmSeconds:       90,
 	}
 }
 
@@ -107,6 +114,9 @@ func (c Config) validate() error {
 	}
 	if c.GuideURL != "" && !strings.HasPrefix(c.GuideURL, "http://") && !strings.HasPrefix(c.GuideURL, "https://") {
 		return fmt.Errorf("guide_url %q must start with http:// or https://", c.GuideURL)
+	}
+	if c.WarmSeconds < 0 || c.WarmSeconds > 3600 {
+		return fmt.Errorf("warm_seconds %d out of range 0..3600", c.WarmSeconds)
 	}
 	if c.GuideRefreshHours < 0 || c.GuideRefreshHours > 168 {
 		return fmt.Errorf("guide_refresh_hours %d out of range 0..168", c.GuideRefreshHours)

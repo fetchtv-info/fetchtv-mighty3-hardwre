@@ -72,17 +72,27 @@ func firstKeyframeOffset(buf []byte, base int64) int64 {
 // not at the first keyframe of the file, or it races through old footage (and
 // looks like a bandwidth spike). It falls back to offset 0 when nothing better
 // presents itself.
-func keyframeStart(f *os.File) int64 {
+// keyframeStart waits for the recording to fill enough to scan, then returns the
+// offset of a keyframe at or after floor.
+//
+// floor matters because the box recycles recording names: when a stream is
+// started while the previous one is still being torn down, the file already
+// holds the previous channel's video. Scanning the tail of that file finds a
+// keyframe inside the OLD channel, which is what made a VLC playlist switch show
+// a few seconds of the channel being left before stalling.
+func keyframeStart(f *os.File, floor int64) int64 {
+	if floor < 0 {
+		floor = 0
+	}
 	deadline := time.Now().Add(tsKeyframeWait)
 	for {
-		if st, err := f.Stat(); err == nil && st.Size() >= int64(tsPacketSize*8) {
+		if st, err := f.Stat(); err == nil && st.Size() > floor+int64(tsPacketSize*8) {
 			size := st.Size()
 
-			// Live edge first: the first keyframe in the last few seconds of the
-			// recording.
+			// Prefer the live edge, but never earlier than the floor.
 			from := size - tsLiveWindow
-			if from < 0 {
-				from = 0
+			if from < floor {
+				from = floor
 			}
 			span := size - from
 			buf := make([]byte, span)
@@ -92,27 +102,26 @@ func keyframeStart(f *os.File) int64 {
 				}
 			}
 
-			// Nothing in the live window yet (fresh recording, or the recorder is
-			// between keyframes): fall back to the start of the file.
-			if from > 0 && size >= int64(tsPacketSize*8) {
-				head := size
+			// No keyframe in the window: scan forward from the floor itself.
+			if from > floor {
+				head := size - floor
 				if head > tsScanWindow {
 					head = tsScanWindow
 				}
 				buf2 := make([]byte, head)
-				if _, err := f.ReadAt(buf2, 0); err == nil || err == io.EOF {
-					if off := firstKeyframeOffset(buf2, 0); off >= 0 {
+				if _, err := f.ReadAt(buf2, floor); err == nil || err == io.EOF {
+					if off := firstKeyframeOffset(buf2, floor); off >= 0 {
 						return off
 					}
 				}
 			}
-			if size >= tsLiveWindow+tsScanWindow {
-				return 0 // long file, no keyframe anywhere we looked
+			if size >= floor+tsLiveWindow+tsScanWindow {
+				return floor // nothing found; serve new data from its very start
 			}
 		}
 		if time.Now().After(deadline) {
-			return 0
+			return floor
 		}
-		time.Sleep(tsScanPollSleep)
+		time.Sleep(100 * time.Millisecond)
 	}
 }

@@ -117,7 +117,10 @@
     for (var i = 0; i < n; i++) {
       var lcn = num(call("Ag_dvb_GetLogicalChannelNumberByIndex", [0, i]));
       var name = channelName(call("Ag_dvb_GetChannelNameByIndex", [0, lcn]));
-      if (lcn > 0) { channels.push({ lcn: lcn, name: name }); }
+      // The multiplex frequency lets the daemon tell a stuck recording tuner
+      // from a full pool (same call the vendor UI uses).
+      var freq = num(call("Ag_dvb_GetFrequencyByLCN", [0, lcn]));
+      if (lcn > 0) { channels.push({ lcn: lcn, name: name, freq: freq > 0 ? freq : 0 }); }
     }
     log("channels read: " + channels.length);
     postChannels();
@@ -219,6 +222,7 @@
       { k: "Jellyfin", v: daemonUrl() || "unknown", act: null },
       { k: "IPTV playlist", v: daemonUrl() ? daemonUrl() + "playlist.m3u" : "unknown", act: null },
       { k: "XMLTV guide", v: daemonUrl() ? daemonUrl() + "guide.xml" : "unknown", act: null },
+      { k: "TVH API", v: daemonUrl() ? daemonUrl() + "api/serverinfo" : "unknown", act: null },
       { k: "Channels", v: channels.length + " stored", act: null },
       { k: "Scan for channels", v: "clears the list, stops live TV", act: askScan },
       { k: "Refresh guide", v: guideSummary(), act: refreshGuide },
@@ -226,6 +230,7 @@
       { k: "Debug harness", v: daemon.debug ? "on" : "off", act: toggleDebug },
       { k: "Tuned channels", v: (daemon.streams && daemon.streams.length) ? daemon.streams.join(", ") : "none", act: null },
       { k: "Viewing Live", v: viewingSummary(), act: null },
+      { k: "Recording tuners", v: daemon.tuner_warning ? daemon.tuner_warning : "ok", act: null },
       { k: "Boot count", v: (daemon.boot_count || 0) + " of 3 (resets after 90s)", act: null },
       { k: "Version", v: (daemon.version || "?") + "  (phase " + (daemon.phase || "?") + ")", act: null }
     ];
@@ -457,6 +462,156 @@
       if (c.cmd === "rec_stop") { cmdBusy = true; recStop(c); return; }
       if (c.cmd === "stream_start") { cmdBusy = true; streamStart(c); return; }
       if (c.cmd === "stream_stop") { cmdBusy = true; streamStop(c); return; }
+      if (c.cmd === "stream_stopid") { streamStopID(c); return; }
+      if (c.cmd === "setfile") { cmdBusy = true; setFile(c); return; }
+      if (c.cmd === "pvrscan") {
+        // Inventory only: entries whose id looks like one of ours (created today,
+        // ids around 7.7e8). The owner's library ids are around 3.4e8.
+        var out = [];
+        var n = num(call("Ag_playBack_rangeFile", [0, 0]));
+        out.push("count=" + n);
+        for (var i = 0; i < n; i++) {
+          var info = String(call("Ag_playBack_getFileInfo", [i]));
+          var f = info.split("@");
+          var id = num(f[0]);
+          if (id > 700000000) { out.push(i + ":" + id + ":" + f[4]); }
+        }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "pvrtop") {
+        var out = [];
+        var n = num(call("Ag_playBack_rangeFile", [0, 0]));
+        out.push("count=" + n);
+        for (var i = 0; i < 4 && i < n; i++) {
+          out.push(i + ":" + String(call("Ag_playBack_getFileInfo", [i])).slice(0, 90));
+        }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "recdir") {
+        // Point the recorder's output at a directory. Used only to test whether
+        // the vendor setting is honoured per start; the value is restored
+        // immediately afterwards.
+        var f = p.Ag_record_NFSDirectorySet;
+        if (typeof f !== "function") { report(c, false, "NFSDirectorySet missing"); cmdBusy = false; return; }
+        var r = call("Ag_record_NFSDirectorySet", [String(c.arg)]);
+        report(c, true, "arity=" + f.length + " set(" + c.arg + ")=" + r);
+        cmdBusy = false;
+        return;
+      }
+      if (c.cmd === "recbyid") {
+        // Resolve a recording id through the vendor PVR index. This is the only
+        // authoritative link between the id Ag_record_create() returned and the
+        // file the box is writing: the index entry carries that recording's size.
+        var id = num(c.arg);
+        var idx = call("Ag_playBack_getIndexByID", [id]);
+        if (num(idx) < 0) { report(c, false, "id " + id + " not in index"); cmdBusy = false; return; }
+        var info = String(call("Ag_playBack_getFileInfo", [num(idx)]));
+        report(c, true, "index=" + idx + " info=" + info.replace(/ /g, "_"));
+        cmdBusy = false;
+        return;
+      }
+      if (c.cmd === "pvrdeleteid") {
+        // Delete through the vendor index, never by unlink: an unlinked file
+        // leaves a stale index entry and the box then reuses the name for the
+        // next recording, truncating whatever was there.
+        var want = String(c.arg);
+        var n = num(call("Ag_playBack_rangeFile", [0, 0]));
+        var found = -1;
+        for (var i = 0; i < n; i++) {
+          var info = String(call("Ag_playBack_getFileInfo", [i]));
+          if (info.split("@")[0] === want) { found = i; break; }
+        }
+        if (found < 0) { report(c, false, "id " + want + " not in PVR index"); cmdBusy = false; return; }
+        var del = call("Ag_playBack_deleteFile", [found]);
+        report(c, true, "deleted index=" + found + " id=" + want + " r=" + del);
+        cmdBusy = false;
+        return;
+      }
+      if (c.cmd === "pvrlist") {
+        var out = [];
+        var n = call("Ag_playBack_rangeFile", [0, 0]);
+        out.push("count=" + n);
+        var c0 = num(n);
+        for (var i = Math.max(0, c0 - 6); i < c0; i++) {
+          out.push(i + ":" + String(call("Ag_playBack_getFileInfo", [i])).slice(0, 90));
+        }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "pvrdelete") {
+        var idx = num(c.arg);
+        var r = call("Ag_playBack_deleteFile", [idx]);
+        report(c, true, "delete(" + idx + ")=" + r);
+        return;
+      }
+      if (c.cmd === "timerprobe") {
+        var out = [];
+        var n = -1;
+        try { n = p.Ag_record_getNoOfTimer(); } catch (e) { out.push("noOfTimer:throw"); }
+        out.push("noOfTimer=" + n);
+        for (var i = 0; i < (n > 0 ? n : 0); i++) {
+          try { out.push("t" + i + "=" + JSON.stringify(p.Ag_record_getTimerInfoByIndex(i)).slice(0, 140)); } catch (e) { out.push("t" + i + ":throw"); }
+        }
+        try { out.push("recErr=" + JSON.stringify(p.Ag_record_getTimerRecError())); } catch (e) { out.push("recErr:throw"); }
+        try { out.push("tuners=" + JSON.stringify(p.Ag_record_getTunerIndexByLCN(15))); } catch (e) { out.push("tuners:throw"); }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "recprobe2") {
+        var out = [];
+        try { out.push("recStatus()=" + JSON.stringify(p.Ag_record_getRecordStatus())); } catch (e) { out.push("recStatus():throw"); }
+        for (var h = 0; h < 4; h++) {
+          try { out.push("status(" + h + ")=" + JSON.stringify(p.Ag_record_getStatus(h))); } catch (e) { out.push("status(" + h + "):throw"); }
+        }
+        for (var i = 0; i < 4; i++) {
+          try { out.push("info(" + i + ")=" + JSON.stringify(p.Ag_record_getInfo(i)).slice(0, 80)); } catch (e) { out.push("info(" + i + "):throw"); }
+        }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "recprobe") {
+        var out = [];
+        var fns = ["Ag_record_stop", "Ag_record_stopIPAndID", "Ag_record_getRecordStatus",
+                   "Ag_record_getStatus", "Ag_record_getInfo", "Ag_record_getNoOfFile",
+                   "Ag_record_getTunerIndexByLCN"];
+        for (var i = 0; i < fns.length; i++) {
+          var f = p[fns[i]];
+          out.push(fns[i].replace("Ag_record_", "") + "=" + (typeof f) + "/" + (f ? f.length : "-"));
+        }
+        try { out.push("noOfFile=" + JSON.stringify(p.Ag_record_getNoOfFile())); } catch (e) { out.push("noOfFile:throw"); }
+        try { out.push("noOfFile0=" + JSON.stringify(p.Ag_record_getNoOfFile(0))); } catch (e) { out.push("noOfFile0:throw"); }
+        for (var h = 0; h < 2; h++) {
+          try { out.push("status(" + h + ")=" + JSON.stringify(p.Ag_record_getRecordStatus(h))); } catch (e) { out.push("status(" + h + "):throw"); }
+        }
+        report(c, true, out.join(" | "));
+        return;
+      }
+      if (c.cmd === "bridge") {
+        /* Debug: list bridge members whose name matches the regex in arg, with
+           their declared arity. Read-only - nothing is called. */
+        var re = new RegExp(c.arg || ".", "i"), hits = [];
+        for (var bk in p) { if (re.test(bk)) { hits.push(bk + "/" + (typeof p[bk] === "function" ? p[bk].length : typeof p[bk])); } }
+        report(c, true, hits.length + ": " + hits.join(","));
+        return;
+      }
+      if (c.cmd === "bridgecall") {
+        /* Debug: call one read-only getter, arg "Name|a1|a2"; numeric args are
+           passed as numbers. Only names starting Ag_dvb_Get/Ag_dvb_get. */
+        var parts = String(c.arg).split("|"), fn = parts.shift();
+        if (!/^Ag_dvb_[Gg]et/.test(fn)) { report(c, false, "only Ag_dvb_get* getters"); return; }
+        var args = parts.map(function (x) { return /^-?\d+$/.test(x) ? Number(x) : x; });
+        var r = call(fn, args);
+        report(c, true, fn + "(" + args.join(",") + ") = " + JSON.stringify(r));
+        return;
+      }
+      if (c.cmd === "reclist") {
+        var names = [];
+        for (var k in p) { if (/record/i.test(k)) { names.push(k); } }
+        report(c, true, names.join(","));
+        return;
+      }
       if (c.cmd === "ua") { report(c, true, navigator.userAgent + " | appVersion=" + navigator.appVersion); return; }
       if (c.cmd === "reload") {
         /* Deploying app.js does not reload this webview, so a reboot used to be
@@ -597,58 +752,82 @@
   function streamStart(c) {
     var lcn = num(c.arg);
     log("stream: start lcn=" + lcn);
-    pvrNames(function (before) {
-      if (!before) { report(c, false, "pvr listing failed"); cmdBusy = false; return; }
-      ensurePvr(function (ready) {
-        if (!ready) { report(c, false, "pvr not ready"); cmdBusy = false; return; }
-        var id = call("Ag_record_create", []);
-        if (num(id) <= 0) { report(c, false, "create failed id=" + id); cmdBusy = false; return; }
-        var h = call("Ag_record_startByLCNAndID", [lcn, id]);
-        if (h === -1 || String(h).indexOf("throw:") === 0) {
-          report(c, false, "start failed h=" + h + " id=" + id);
-          cmdBusy = false;
-          return;
-        }
-        var probes = 0;
-        var finder = setInterval(function () {
-          pvrNames(function (now) {
-            if (!now) { return; }
-            for (var n in now) {
-              if (!before.hasOwnProperty(n)) {
-                clearInterval(finder);
-                recs[lcn] = { handle: h, id: id, file: n };
-                log("stream: lcn=" + lcn + " handle=" + h + " file=" + n);
-                report(c, true, "file=" + n + " id=" + id + " handle=" + h + " lcn=" + lcn);
-                cmdBusy = false;
-                return;
-              }
-            }
-            if (++probes > 30) {
-              clearInterval(finder);
-              report(c, false, "no file appeared for lcn=" + lcn);
-              cmdBusy = false;
-            }
-          });
-        }, 400);
-      });
+    ensurePvr(function (ready) {
+      if (!ready) { report(c, false, "pvr not ready"); cmdBusy = false; return; }
+      var id = call("Ag_record_create", []);
+      if (num(id) <= 0) { report(c, false, "create failed id=" + id); cmdBusy = false; return; }
+      var h = call("Ag_record_startByLCNAndID", [lcn, id]);
+      if (h === -1 || String(h).indexOf("throw:") === 0) {
+        report(c, false, "start failed h=" + h + " id=" + id);
+        cmdBusy = false;
+        return;
+      }
+      // Answer as soon as the recorder is running. The daemon runs on this box
+      // and watches /mnt/usb1/PVR itself, so waiting here for the file to appear
+      // only delays the first byte -- and IPTV scanners give up after 5 seconds.
+      recs[lcn] = { handle: h, id: id, file: "" };
+      report(c, true, "id=" + id + " handle=" + h + " lcn=" + lcn);
+      cmdBusy = false;
     });
   }
 
-  function streamStop(c) {
-    var lcn = num(c.arg);
+  /* The daemon resolves the filename itself (it can see the PVR directory) and
+     sends it here, so stopping can still delete the file. */
+  /* Stop by the id returned by Ag_record_create, which is the record object
+     nexus itself stops (NEXUS_Record_Stop), rather than the value returned by
+     startByLCNAndID. */
+  function streamStopID(c) {
+    var parts = String(c.arg).split("|");
+    var lcn = num(parts[0]);
+    var id = num(parts[1]);
     var r = recs[lcn];
-    if (!r) { report(c, true, "no stream tracked for lcn=" + lcn); cmdBusy = false; return; }
-    var stopped = call("Ag_record_stop", [r.handle]);
+    if (!id && r) { id = r.id; }
+    var stopped = call("Ag_record_stop", [id]);
     delete recs[lcn];
-    log("stream: stop lcn=" + lcn + " handle=" + r.handle + " -> " + stopped +
-        ", deleting " + r.file);
-    var x = new XMLHttpRequest();
-    x.open("GET", "/api/pvr_delete?name=" + encodeURIComponent(r.file), true);
-    x.onload = function () {
-      report(c, true, "stop=" + stopped + " deleted=" + r.file);
+    log("stream: stopid lcn=" + lcn + " id=" + id + " -> " + stopped);
+    report(c, true, "stopid=" + stopped);
+    cmdBusy = false;
+  }
+
+  function setFile(c) {
+    var parts = String(c.arg).split("|");
+    var lcn = num(parts[0]);
+    if (recs[lcn]) { recs[lcn].file = parts[1] || ""; }
+    log("stream: lcn=" + lcn + " file=" + (parts[1] || "?"));
+    report(c, true, "set file " + (parts[1] || "?"));
+    cmdBusy = false;
+  }
+
+  function streamStop(c) {
+    // The daemon sends "lcn|handle": the handle lets us stop the recorder even
+    // if this page's map was cleared by a reload, which used to leave the
+    // recorder running until the box ran out of slots.
+    var parts = String(c.arg).split("|");
+    var lcn = num(parts[0]);
+    var r = recs[lcn];
+    var handle = parts.length > 1 && parts[1] !== "" ? num(parts[1]) : (r ? r.handle : null);
+    if (handle === null || handle === undefined) {
+      report(c, true, "no handle for lcn=" + lcn);
       cmdBusy = false;
-    };
-    x.send();
+      return;
+    }
+    var stopped = call("Ag_record_stop", [handle]);
+    delete recs[lcn];
+    var file = r ? r.file : "";
+    log("stream: stop lcn=" + lcn + " handle=" + handle + " -> " + stopped +
+        " (file " + (file || "unknown") + " left for the daemon to delete by index)");
+    if (!file) {
+      // The daemon deletes the file itself once the stop is acknowledged.
+      report(c, true, "stop=" + stopped + " deleted=(daemon)");
+      cmdBusy = false;
+      return;
+    }
+    // The daemon removes the file through the vendor PVR index
+    // (Ag_playBack_deleteFile). It must not be unlinked here: an unlinked file
+    // leaves a stale index entry and the box then reuses the name for the next
+    // recording, truncating whatever was there.
+    report(c, true, "stop=" + stopped + " file=" + file);
+    cmdBusy = false;
   }
 
   /* ---------- keys ----------------------------------------------------- */
@@ -713,6 +892,15 @@
     x.onreadystatechange = function () {
       if (x.readyState !== 4 || x.status !== 200) { return; }
       try { daemon = JSON.parse(x.responseText); } catch (e) { return; }
+      // The daemon forgets what the box is tuned to whenever it restarts, and
+      // the page only reports on a tune, so re-assert it while it reads empty
+      // and we are actually showing live TV. Without this the menu says "none"
+      // until the viewer next changes channel.
+      if (!daemon.viewing_lcn || !daemon.viewing_lcn.lcn) {
+        // Report whatever the vendor player is last known to be tuned to, even
+        // while the menu is up: the player keeps showing that channel.
+        if (channels[idx] && channels[idx].lcn) { reportViewing(channels[idx]); }
+      }
       if (mode === "menu") { buildMenu(); }
     };
     x.send();
