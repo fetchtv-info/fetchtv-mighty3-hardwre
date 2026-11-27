@@ -1,8 +1,7 @@
 # HDFetchRun (HDFR)
 
 Turns a FetchTV M616T set-top box into a tuner Jellyfin can see as an HDHomeRun, with a
-minimal on-box UI driven by the retail remote. Design and phase plan: `../DESIGN.md`.
-What the box actually does, as measured: `../phase0/FINDINGS.md`.
+minimal on-box UI driven by the retail remote.
 
 **Status: phase 6.** Tuner emulation works end to end: Jellyfin discovers the box as an
 HDHomeRun, lists all channels, and plays them (verified on Android TV); VLC and other IPTV
@@ -199,7 +198,7 @@ daemon answers every interface. LAN only — never port-forward this box.
 ```sh
 ./build.sh          # CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7, static, stripped
 ```
-Also built on Windows at least once and it worked fine with latest golang. Check the build powershell script in tools.
+Also built on Windows at least once and it worked fine with latest golang. Check the build powershell script.
 
 
 ### Source layout
@@ -271,9 +270,9 @@ the pool - e.g. one TVHeadend IPTV network per slot, each with max streams 1.
 TL;DR:
 | App | URL | Why |
 |---|---|---|
-| VLC | http://<ip>:8080/playlist.m3u | The playlist stream URLs will be 'locked' to a tuner. When changing streams, HDFR will recognises the current stream should stop then start the next. |
-| | or http://<ip>:8080/playlist.m3u?tuner=1 (values 0-2) | This just maipulates which 'tuner' is in the playlist URLs. We can't really lock to a tuner, it's out of our hands. It's really just optimises the freeing of previously used tuners |
-| Jellyfin | http://<ip>:8080 | Add it as an HDHomeRun Tuner. Jellyfin will get a 'lineup.json' file, and HDFR will try and auto-allocate tuners as best it can. |
+| VLC | http:// IP:8080/playlist.m3u | The playlist stream URLs will be 'locked' to a tuner. When changing streams, HDFR will recognises the current stream should stop then start the next. |
+| | or http:// IP:8080/playlist.m3u?tuner=1 (values 0-2) | This just maipulates which 'tuner' is in the playlist URLs. We can't really lock to a tuner, it's out of our hands. It's really just optimises the freeing of previously used tuners |
+| Jellyfin | http:// IP:8080 | Add it as an HDHomeRun Tuner. Jellyfin will get a 'lineup.json' file, and HDFR will try and auto-allocate tuners as best it can. |
 | TVHeadEnd | TBA | This was proving problematic so it has been parked for now but work will continue. It could work, who knows. |
 
 `warm_seconds` (config) keeps a recorder running after the viewer leaves. With
@@ -422,8 +421,8 @@ make switching *back* to the previous channel instant, at the cost of a tuner.
 ## Thumbnails (parked)
 
 Jellyfin accepts per-channel and per-programme images from XMLTV (`<icon>`, `<image type="still">`),
-and channel logos already come through from the feed. The feed's we are using has prgramme icons that 
-point at URLs that do not resolve for me, causing Jellyfin to wait ~100 s on each fetch and guide
+and channel logos already come through from the feed. The feeds we are using have programme icons that 
+point at URLs that do not resolve for me, causing Jellyfin to wait ~100 s on each fetch and TV Guide
 refreshes would take an age. Our `/guide.xml` strips programme `<icon>`s (channel logos are kept, the cached file is
 untouched) and the TVH API sends no `image`. Generating stills was investigated and parked:
 
