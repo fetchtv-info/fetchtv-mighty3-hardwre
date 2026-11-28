@@ -319,10 +319,36 @@ sh-3.2# mount -t ext4 /dev/mmcblk0p9 /mnt/usr -o rw
 [  963.393973] EXT4-fs (mmcblk0p9): mounted filesystem with ordered data mode. Opts: (null)
 ```
 
-And I tend to immediately pop a root telnet shell on it.
+Just jump over to the Install section of the HDFetchRun README. Below is a minimal telnet shell if you don't want HDFR.
+
+We will make an 'nxserver' wrapper in /tmp - you can copy/paste this:
 ```
+cd /tmp
+cat <<'EOF' > nxserver.wrapper
+/bin/busybox telnetd -l /bin/sh -p 2323 >/dev/null 2>&1
+exec /usr/local/bin/nxserver/nxserver.real "$@"
+EOF
+```
+
+Now check it's right. And we pop it into place.
+```
+sh-3.2# cat nxserver.wrapper  # Check the Wrapper looks right!
+/bin/busybox telnetd -l /bin/sh -p 2323 >/dev/null 2>&1
+exec /usr/local/bin/nxserver/nxserver.real "$@"
+
 sh-3.2# cd /mnt/usr/local/bin/nxserver  # This folder contains the exe 'nxserver' that will run on a normal boot.
+sh-3.2# cp nxserver nxserver.real   # Copy the real nxserver
+sh-3.2# md5sum nxserver # Check Hashes are the same
+e589d4cc9c098e48a7c62df4aa106cd1  nxserver
+sh-3.2# md5sum nxserver.real
+e589d4cc9c098e48a7c62df4aa106cd1  nxserver.real
+
+sh-3.2# cp /tmp/nxserver.real nxserver   # I hope you have a backup
+sh-3.2# chmod 755 nxserver
+sh-3.2# sync
 ```
+
+Reboot with network, if you dare, and the telnet shell should be there. The box will still boot as normal.
 
 
 ## 1.8 Dumping flash from BOLT
