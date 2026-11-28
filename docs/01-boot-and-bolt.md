@@ -146,14 +146,65 @@ Comments:
 
 ## 1.5 Networking from the loader
 
-- The interface comes up with MAC `00-00-00-00-00-00` even though
-  `ETH0_HWADDR` is set. Nothing will ARP until you set it:
-  `seteth0mac 000000000000` wants **12 hex characters, no separators** and
-  rejects colons. `ifconfig eth0 -hwaddr=aa:bb:cc:dd:ee:ff` does accept them.
+```
+BOLT> printenv
+Variable Name        Value
+-------------------- --------------------------------------------------
+        BOOT_CONSOLE uart0
+              SPLASH ENABLE
+            RUNLEVEL 1
+  FACTORYTESTVERSION 1.0.2077
+              BOOTOK 6
+              KERNEL 0
+              ROOTFS 0
+      KERNEL0VERSION 3.7.12096
+      KERNEL1VERSION 3.7.12051
+         ROOT0FSTYPE ext4
+      ROOTFS0VERSION 3.7.12096
+         ROOT1FSTYPE ext4
+      ROOTFS1VERSION 3.7.12051
+           BAKKERNEL 1
+           BAKROOTFS 1
+BOLT_HYBROAD_VERSION 1.29.2685
+         WIFI_VENDOR WNC
+        BOLT_VERSION 1.29.2685
+           MEMCONFIG vmalloc=380m bmem=768m@1279m bmem=970m@2099m
+   BFW_UPDATE_STATUS 0
+            BOOTTIME 0
+      CHIP_FAMILY_ID 74390011
+           BOARDNAME BCM97252SSV
+            NODENAME BCM97252SSV-(null)
+            ETH0_PHY INT
+      ETH0_MDIO_MODE 1
+          ETH0_SPEED 1000
+        ETH0_PHYADDR 1
+          MEMORYSIZE 3072
+          DT_ADDRESS 7618000
+              USBIPP 0
+             DT_SIZE c432
+         ETH0_HWADDR 0C:56:5C:BA:BA:BA
+*** command status = 0
+```
+
+Take the HW Address reported here, or make one up. Then pop it in with a local IP you have spare:
+
+```
+BOLT> ifconfig eth0 -off
+BOLT> ifconfig eth0 -addr=10.1.1.50 -mask=255.255.255.0 -gw=10.1.1.1 -hwaddr=0c:56:5c:ba:ba:ba
+1000 Mbps Full-Duplex
+Device eth0:  hwaddr 00-00-00-00-00-00, ipaddr 10.1.1.50, mask 255.255.255.0
+        gateway 10.1.1.1, nameserver not set
+*** command status = 0
+BOLT> ping 10.1.1.1
+10.1.1.1 (10.1.1.1) is alive
+10.1.1.1 (10.1.1.1): 1 packets sent, 1 received
+*** command status = 0
+```
+
+- The interface comes up with MAC `00-00-00-00-00-00` even though it has been set.
 - Prefer static configuration:
-  `ifconfig eth0 -addr=192.0.2.10 -mask=255.255.255.0 -gw=192.0.2.1`.
-  `ifconfig eth0 -auto` (DHCP) negotiated 1000/full and then **hung the
-  bootloader** in my tests (YMMV).
+  `ifconfig eth0 -addr=192.0.2.10 -mask=255.255.255.0 -gw=192.0.2.1 --hwaddr=aa:aa:aa:bb:bb:bb`.
+  `ifconfig eth0 -auto` (DHCP) negotiated 1000/full and then **hung the bootloader** in my tests (YMMV).
 - The link takes ~3 s to train after `ifconfig`; verify with `ping <gateway>`
   before starting a TFTP transfer.
 - TFTP is UDP/69 with no port argument.
@@ -199,11 +250,23 @@ loader's own view of flash.
 
 ```
 BOLT> boot flash0.kernel0 "console=ttyS0,115200n8 rdinit=/bin/sh vmalloc=380m bmem=768m@1279m bmem=970m@2099m"
+Loader:zimg Filesys:raw Dev:flash0.kernel0 File:(null) Options:console=ttyS0,115200n8 rdinit=/bin/sh vmalloc=380m bmem=768m@1279m bmem=970m@2099m
+
+get signinfo ok.
+
+Reading 20591944 bytes from zImage........
+...Various boot messages, only takes a few seconds...
+[    2.478900] mmcblk0rpmb: mmc1:0001 004G90 partition 3 512 KiB
+[    2.487791]  mmcblk0: p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15
+[    2.718096] usb 4-1.1: new full-speed USB device number 3 using ehci-brcm
+
+sh-3.2# 
 ```
 
-Two things to know in that shell:
+Note the line showing the MMC flash and various partition numbers.
+Other things to know in that shell:
 
-- `PATH` is minimal. `export PATH=/sbin:/usr/sbin:/bin:/usr/bin:<vendor>/bin`
+- `PATH` is minimal. `export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/home/hybroad/bin`
   first, or `ifconfig` and `grep` are "command not found". Busybox `ip` works
   without the fix.
 - `Ctrl-C` cannot interrupt `rcS`: PID 1 has no controlling terminal, so the
@@ -211,7 +274,58 @@ Two things to know in that shell:
 - The network is **down** in this shell (`rcS` is the only thing that brings it
   up), and there is no default route unless you add one.
 
-## 1.8 Dumping flash
+```
+sh-3.2# export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/home/hybroad/bin
+sh-3.2# ip link set eth0 down
+sh-3.2# ip link set eth0 address 0C:56:5C:BA:BA:BA
+sh-3.2# ip link set eth0 up
+1.50/24 dev eth0[  180.418094] f0b00000.etherne:01: Broadcom BCM7439 (2) PHY revision: 0x10, patch: 1
+[  180.427278] bcmgenet f0b00000.ethernet: configuring instance for internal PHY
+[  180.434492] IPv6: ADDRCONF(NETDEV_UP): eth0: link is not ready
+
+sh-3.2# ip addr add 10.1.1.50/24 dev eth0
+sh-3.2# [  182.431254] bcmgenet f0b00000.ethernet eth0: Link is Down
+[  183.521307] bcmgenet f0b00000.ethernet eth0: Link is Up - 1Gbps/Full - flow control off
+[  183.529345] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready
+```
+
+We need to mount some system filesystems to get a useful shell. Lets do that then check we can see mountpoints etc.
+
+```
+sh-3.2# mount -t proc proc /proc
+sh-3.2# mount -t sysfs sysfs /sys
+sh-3.2# mount -t devtmpfs devtmpfs /dev
+sh-3.2# mount -t tmpfs tmpfs /tmp
+sh-3.2# cat /proc/cmdline
+console=ttyS0,115200n8 rdinit=/bin/sh vmalloc=380m bmem=768m@1279m bmem=970m@2099m
+sh-3.2# cat /proc/mounts
+rootfs / rootfs rw,size=648380k,nr_inodes=147552 0 0
+proc /proc proc rw,relatime 0 0
+sysfs /sys sysfs rw,relatime 0 0
+devtmpfs /dev devtmpfs rw,relatime,size=648380k,nr_inodes=147552,mode=755 0 0
+tmpfs /tmp tmpfs rw,relatime 0 0
+```
+
+The /root is still a ramfs from initramfs. We can fix that.
+
+```
+sh-3.2# mount -t ext4 /dev/mmcblk0p11 /root
+[  826.781424] EXT4-fs (mmcblk0p11): warning: maximal mount count reached, running e2fsck is recommended
+[  826.791580] EXT4-fs (mmcblk0p11): recovery complete
+[  826.804920] EXT4-fs (mmcblk0p11): mounted filesystem with ordered data mode. Opts: (null)
+
+sh-3.2# mkdir /mnt/usr
+sh-3.2# mount -t ext4 /dev/mmcblk0p9 /mnt/usr -o rw
+[  963.393973] EXT4-fs (mmcblk0p9): mounted filesystem with ordered data mode. Opts: (null)
+```
+
+And I tend to immediately pop a root telnet shell on it.
+```
+sh-3.2# cd /mnt/usr/local/bin/nxserver  # This folder contains the exe 'nxserver' that will run on a normal boot.
+
+
+
+## 1.8 Dumping flash from BOLT
 
 `save` reads **memory**, not flash, so each region is a three-step cycle. This
 pipeline pulled the whole 3776 MB in 25 chunks with every host CRC matching the
