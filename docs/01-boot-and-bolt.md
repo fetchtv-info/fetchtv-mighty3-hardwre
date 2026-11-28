@@ -322,7 +322,7 @@ sh-3.2# mount -t ext4 /dev/mmcblk0p9 /mnt/usr -o rw
 And I tend to immediately pop a root telnet shell on it.
 ```
 sh-3.2# cd /mnt/usr/local/bin/nxserver  # This folder contains the exe 'nxserver' that will run on a normal boot.
-
+```
 
 
 ## 1.8 Dumping flash from BOLT
